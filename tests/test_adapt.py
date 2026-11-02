@@ -226,3 +226,93 @@ def test_force_inherit_keeps_template_manuals(tmp_path):
     assert r.manual == "forced"
     assert r.unfilled == []
     assert r.diffs                      # 差异仍然照实报告
+
+
+# ---------------- 身份判定：镜像说了算 ----------------
+
+def test_pick_identity_prefers_image_banner():
+    """解析别的型号的 ROM 时，不能把「手上这台机器」的内核串记进去。"""
+    banner = ("4.19.157-perf-ge2582afab8ec-dirty (onyx@onyxUbuntu) #11 SMP "
+              "PREEMPT Sat May 30 11:56:07 CST 2026")
+    dev = {"kernel": "4.19.157-perf-g77c132eccfab-dirty",
+           "fingerprint": "ONYX/TabBoox/TabBoox:13/TKQ1.230615.001/x:user/release-keys"}
+    kernel, fp = adapt.pick_identity(banner, dev)
+    assert kernel == "4.19.157-perf-ge2582afab8ec-dirty", \
+        "内核串必须来自镜像 banner"
+    assert fp == "", "镜像不是这台机器的，就不该继承它的 fingerprint"
+
+
+def test_pick_identity_keeps_fingerprint_when_same_kernel():
+    """镜像就是这台机器时，fingerprint 沿用设备值（匹配靠它更准）。"""
+    banner = "4.19.157-perf-g77c132eccfab-dirty (onyx@x) #38 SMP"
+    dev = {"kernel": "4.19.157-perf-g77c132eccfab-dirty",
+           "fingerprint": "ONYX/TabBoox/TabBoox:13/xxx:user/release-keys"}
+    kernel, fp = adapt.pick_identity(banner, dev)
+    assert kernel == dev["kernel"] and fp == dev["fingerprint"]
+
+
+def test_pick_identity_without_banner_uses_device():
+    """纯 kallsyms 文本没有 banner，只能信设备。"""
+    dev = {"kernel": "4.19.157-perf-g77c132eccfab-dirty",
+           "fingerprint": "FP"}
+    assert adapt.pick_identity(None, dev) == (dev["kernel"], "FP")
+
+
+def test_pick_identity_explicit_args_win():
+    banner = "4.19.157-perf-ge2582afab8ec-dirty (o) #11 SMP"
+    dev = {"kernel": "4.19.157-perf-g77c132eccfab-dirty", "fingerprint": "FP"}
+    kernel, fp = adapt.pick_identity(banner, dev, kernel="4.19.157-hand-set",
+                                     fingerprint="FP-HAND")
+    assert kernel == "4.19.157-hand-set" and fp == "FP-HAND"
+
+
+def test_pick_identity_no_adb():
+    """没连设备：镜像有 banner 就按 banner，指纹留空。"""
+    banner = "4.19.157-perf-ge2582afab8ec-dirty (o) #11 SMP"
+    assert adapt.pick_identity(banner, {}) == \
+        ("4.19.157-perf-ge2582afab8ec-dirty", "")
+
+
+# ---------------- 身份判定：镜像说了算 ----------------
+
+def test_pick_identity_prefers_image_banner():
+    """解析别的型号的 ROM 时，不能把「手上这台机器」的内核串记进去。"""
+    banner = ("4.19.157-perf-ge2582afab8ec-dirty (onyx@onyxUbuntu) #11 SMP "
+              "PREEMPT Sat May 30 11:56:07 CST 2026")
+    dev = {"kernel": "4.19.157-perf-g77c132eccfab-dirty",
+           "fingerprint": "ONYX/TabBoox/TabBoox:13/TKQ1.230615.001/x:user/release-keys"}
+    kernel, fp = adapt.pick_identity(banner, dev)
+    assert kernel == "4.19.157-perf-ge2582afab8ec-dirty", \
+        "内核串必须来自镜像 banner"
+    assert fp == "", "镜像不是这台机器的，就不该继承它的 fingerprint"
+
+
+def test_pick_identity_keeps_fingerprint_when_same_kernel():
+    """镜像就是这台机器时，fingerprint 沿用设备值（匹配靠它更准）。"""
+    banner = "4.19.157-perf-g77c132eccfab-dirty (onyx@x) #38 SMP"
+    dev = {"kernel": "4.19.157-perf-g77c132eccfab-dirty",
+           "fingerprint": "ONYX/TabBoox/TabBoox:13/xxx:user/release-keys"}
+    kernel, fp = adapt.pick_identity(banner, dev)
+    assert kernel == dev["kernel"] and fp == dev["fingerprint"]
+
+
+def test_pick_identity_without_banner_uses_device():
+    """纯 kallsyms 文本没有 banner，只能信设备。"""
+    dev = {"kernel": "4.19.157-perf-g77c132eccfab-dirty",
+           "fingerprint": "FP"}
+    assert adapt.pick_identity(None, dev) == (dev["kernel"], "FP")
+
+
+def test_pick_identity_explicit_args_win():
+    banner = "4.19.157-perf-ge2582afab8ec-dirty (o) #11 SMP"
+    dev = {"kernel": "4.19.157-perf-g77c132eccfab-dirty", "fingerprint": "FP"}
+    kernel, fp = adapt.pick_identity(banner, dev, kernel="4.19.157-hand-set",
+                                     fingerprint="FP-HAND")
+    assert kernel == "4.19.157-hand-set" and fp == "FP-HAND"
+
+
+def test_pick_identity_no_adb():
+    """没连设备：镜像有 banner 就按 banner，指纹留空。"""
+    banner = "4.19.157-perf-ge2582afab8ec-dirty (o) #11 SMP"
+    assert adapt.pick_identity(banner, {}) == \
+        ("4.19.157-perf-ge2582afab8ec-dirty", "")

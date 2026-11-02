@@ -32,7 +32,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from ..core import elfsyms, kimage, ndk
+from ..core import ainsn, elfsyms, kimage, ndk
 from ..core.errors import L5Error
 
 TARGET_API = "35"
@@ -97,7 +97,8 @@ class GenResult:
     missing: list[str]
     banner: str | None
     symfp: Path | None
-    manual: str                   # "filled" / "inherited" / "template"
+    manual: str                   # "template" / "inherited" / "forced"
+    auto: dict = field(default_factory=dict)   # 反汇编扫出来的手工宏
 
     @property
     def ready(self) -> bool:
@@ -206,7 +207,7 @@ def build_target_h(template_path, out_path, offsets, fingerprint, kernel_ver,
         if v is not None:
             txt, ok = _sub_macro(txt, macro, "0x%X" % v)
             if ok:
-                say("  %-28s = 0x%X  （沿用模板值）" % (macro, v))
+                say("  %-28s = 0x%X  （已定标）" % (macro, v))
                 continue
         txt, ok = _sub_macro(txt, macro, "%s 0x0" % FILL_MARK)
         if ok:
@@ -445,6 +446,29 @@ def compile_preload(exploit_dir, target_dir, cc, out_so, log=None, cancel=None):
 # ----------------------------------------------------------------------
 # 主体
 # ----------------------------------------------------------------------
+def pick_identity(banner: str | None, dev: dict,
+                  kernel: str = "", fingerprint: str = "") -> tuple[str, str]:
+    """决定这份 target 记哪个内核串、哪个指纹。
+
+    镜像 banner 里写着这份内核到底是什么版本，它优先于「手里连着的设备」：
+    解析别的型号的 ROM 时，设备内核串属于那台机器，不属于这份镜像。
+    借过来会让 target 记错版本 —— root exploit 的内核闸永远比不中，
+    或者更糟：两个不同的镜像被认成同一份。
+
+    指纹同理。只有镜像内核串与设备完全一致（说明镜像就是这台机器的）
+    才沿用设备的 build fingerprint；否则留空，靠内核串和符号指纹去匹配，
+    编一个指纹只会认错机器。
+    """
+    img_ver = (kimage.parse_banner(banner) or {}).get("version") or ""
+    out_kernel = kernel or img_ver or (dev.get("kernel") or "")
+    if fingerprint:
+        return out_kernel, fingerprint
+    same_dev = bool(img_ver) and img_ver == (dev.get("kernel") or "")
+    if same_dev or not img_ver:
+        return out_kernel, dev.get("fingerprint") or ""
+    return out_kernel, ""
+
+
 class Adapter:
     """一次适配会话。cfg 决定工作区与target仓库位置，adb 只用来读设备。"""
 
@@ -556,6 +580,40 @@ class Adapter:
             return {}
         return out
 
+    # ---------------- 自动定标手工宏 ----------------
+    def calibrate_image(self, src) -> dict:
+        """从裸 Image 里把「指令里就写着」的手工宏扫出来。
+
+        能扫的：TASK_REAL_CRED_OFF / TASK_CRED_OFF / PRCTL_FRAME_TOTAL。
+        扫不出的（WAITER_LOCAL_OFF 只给提示，PRCTL_WAITER_WORD_DEFAULT 是
+        语义常量）交给 build_target_h 留占位符。
+
+        ELF 源直接跳过：ELF 里符号是绝对地址，文件偏移与 Image 不同，
+        硬扫会得出看着对、其实错位的数。宁可少填。
+        """
+        try:
+            with open(src, "rb") as f:
+                if f.read(4) == b"\x7fELF":
+                    self._say("  （源是 ELF，跳过指令定标：只对裸 Image 有效）")
+                    return {}
+        except OSError:
+            return {}
+
+        from ..core import imageksym
+        try:
+            syms = imageksym.ImageKallsyms(str(src)).symbols()
+        except Exception as ex:                    # 不是内核镜像就安静退出
+            self._say("  （符号表读不出来，跳过指令定标：%s）" % ex)
+            return {}
+        if "_text" not in syms:
+            return {}
+        try:
+            buf = Path(src).read_bytes()
+        except OSError:
+            return {}
+        got, _ev = ainsn.calibrate(buf, syms, log=self._say)
+        return got
+
     # ---------------- 生成 target.h ----------------
     def gen(self, src_path, fingerprint: str = "", kernel: str = "",
             tid: str | None = None, inherit_manual: bool = True,
@@ -582,8 +640,8 @@ class Adapter:
             say("  （自动解包：%s）" % how)
 
         dev = self.device_meta()
-        fingerprint = fingerprint or dev.get("fingerprint", "")
-        kernel = kernel or dev.get("kernel", "")
+        kernel, fingerprint = pick_identity(
+            banner, dev, kernel=kernel, fingerprint=fingerprint)
 
         if banner:
             say("  镜像 banner: %s" % banner)
@@ -591,7 +649,11 @@ class Adapter:
                 v, why, adv = kimage.banner_match(banner, dev["kernel"])
                 say("  %s %s" % (kimage.VERDICT_TAG[v], why))
                 if v != "same":
+                    # 离线适配别的型号的 ROM 时这条必然触发，不是错误：
+                    # 它只说「这份镜像不来自手上这台机器」。
                     say("      %s" % adv)
+            if (kimage.parse_banner(banner) or {}).get("version"):
+                say("  记入 target 的内核串: %s（来源：镜像 banner）" % kernel)
         else:
             say("  [!] 读不到 linux_banner —— 这个文件可能不是完整内核镜像")
 
@@ -617,6 +679,31 @@ class Adapter:
             if tm and same and not miss_manual(tm):
                 manual, manual_mode = tm, "inherited"
 
+        # 3 个手工宏（real_cred / cred / prctl 帧）本来就写在指令立即数里，
+        # 先扫一遍：扫到的按镜像写死，扫不到的才留占位符让人反汇编。
+        # 这一步让「换一台不同构建的机器」从「四个宏全靠人肉」变成「零人工」。
+        auto = self.calibrate_image(src)
+        if auto:
+            for k, v in auto.items():
+                old = manual.get(k)
+                if old is not None and old != v:
+                    say("  [!] %s：模板 0x%X，镜像 0x%X —— 按镜像写"
+                        % (k, old, v))
+            manual = dict(manual, **auto)
+
+            # PRCTL_WAITER_WORD_DEFAULT 是「从 prctl 栈上第几个 word 取 waiter」，
+            # 只由帧大小和 waiter 布局决定。这两样都定标成功、且与模板一致时，
+            # 沿用模板值是有依据的推断，不是猜；不一致就继续留占位符。
+            if ("WAITER_LOCAL_OFF" in auto and "PRCTL_FRAME_TOTAL" in auto
+                    and "PRCTL_WAITER_WORD_DEFAULT" not in manual
+                    and tm.get("WAITER_LOCAL_OFF") == auto["WAITER_LOCAL_OFF"]
+                    and tm.get("PRCTL_FRAME_TOTAL") == auto["PRCTL_FRAME_TOTAL"]):
+                manual["PRCTL_WAITER_WORD_DEFAULT"] = tm["PRCTL_WAITER_WORD_DEFAULT"]
+                say("  [推断] PRCTL_WAITER_WORD_DEFAULT = 0x%X"
+                    "（waiter 0x%X 与帧 0x%X 都与模板一致）"
+                    % (tm["PRCTL_WAITER_WORD_DEFAULT"],
+                       auto["WAITER_LOCAL_OFF"], auto["PRCTL_FRAME_TOTAL"]))
+
         unf, nf, diffs = build_target_h(
             tmpl, tdir / "target.h", offs, fingerprint, kernel,
             log=say, syms_mode="keep" if keep else "trust",
@@ -630,13 +717,14 @@ class Adapter:
         save_manifest(tdir, {
             "id": tid, "fingerprint": fingerprint, "kernel": kernel,
             "banner": banner, "manual": manual_mode,
+            "auto": {k: "0x%X" % v for k, v in auto.items()},
             "offsets": len(offs), "diffs": len(diffs),
             "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
             "source": os.path.abspath(str(src_path)),
         })
         return GenResult(tid=tid, tdir=tdir, unfilled=unf, diffs=diffs,
                          offsets=len(offs), missing=miss, banner=banner,
-                         symfp=sfp, manual=manual_mode)
+                         symfp=sfp, manual=manual_mode, auto=auto)
 
     # ---------------- 编译 ----------------
     def compile(self, tdir, out_so=None, cc: str | None = None,

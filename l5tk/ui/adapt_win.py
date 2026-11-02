@@ -126,7 +126,7 @@ class AdaptWindow(tk.Toplevel):
         self.tbl.tag_config("note", foreground=MUTED)
 
         # ③ 四个手工宏
-        tk.Label(body, text="③ 4 个手工宏（符号表里没有；同源构建会自动沿用模板值）",
+        tk.Label(body, text="③ 手工宏（能扫出来的已自动填好，剩下的才要你填）",
                  bg=BG, fg=ACCENT, font=(FONT[0], 9, "bold"), anchor="w").pack(fill="x")
         self.fill_entries: dict[str, tk.Entry] = {}
         grid = tk.Frame(body, bg=BG)
@@ -377,20 +377,27 @@ class AdaptWindow(tk.Toplevel):
         self.target = r
         self.q.put(("status", "gen", "已生成 %s" % r.tid, OK))
         self._fill_table(r.diffs)
-        # 同源构建：4 个值自动填好，用户可以直接编译
+        # 三档来源：指令扫出来的 > 同源继承的 > 用户自己填的
         tpl = template_manuals(self.adapter.template())
         for macro, e in self.fill_entries.items():
             e.delete(0, "end")
-            if macro in tpl and r.manual == "inherited":
+            if macro in r.auto:
+                e.insert(0, "0x%X" % r.auto[macro])
+            elif macro in tpl and r.manual == "inherited":
                 e.insert(0, "0x%X" % tpl[macro])
+        if r.auto:
+            self.say("自动定标：%s"
+                     % "  ".join("%s=0x%X" % (k, v) for k, v in r.auto.items()),
+                     "ok")
         if r.unfilled:
             self.say("还差 %d 个手工宏：%s" % (len(r.unfilled), ", ".join(r.unfilled)),
                      "warn")
-            self.say("  这四个值符号表里没有：看下面提示，反汇编或 panic 定标后填进来",
+            self.say("  这几个值指令里读不出来：按提示反汇编或 panic 定标后填进来",
                      "warn")
         else:
-            self.say("4 个手工宏%s，可以直接编译" %
-                     ("已沿用模板值（同源构建）" if r.manual == "inherited"
+            self.say("手工宏%s，可以直接编译" %
+                     ("已全部定标" if r.auto else
+                      "已沿用模板值（同源构建）" if r.manual == "inherited"
                       else "已填"), "ok")
         if r.symfp:
             self.say("符号指纹已存 %s（以后不用 root 也能认出这台设备）" % r.symfp,

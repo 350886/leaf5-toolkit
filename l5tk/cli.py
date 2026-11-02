@@ -130,7 +130,7 @@ def build_parser() -> argparse.ArgumentParser:
                     help="明知与模板有差异也沿用模板的 4 个手工宏"
                          "（你确认这台设备的结构体布局与模板一致时才用）")
 
-    a5 = asub.add_parser("fill", help="填 target.h 里那 4 个手工宏")
+    a5 = asub.add_parser("fill", help="手填 target.h 里剩下的手工宏")
     a5.add_argument("tid")
     a5.add_argument("--set", action="append", default=[], metavar="MACRO=VALUE",
                     help="可重复；VALUE 收 0x 或十进制")
@@ -578,10 +578,13 @@ def cmd_adapt(args, log) -> int:
               % {"inherited": "沿用模板值（同源构建）",
                  "forced": "沿用模板值（--inherit 强制）",
                  "template": "待填"}.get(r.manual, r.manual))
+        if r.auto:
+            print("自动定标    : %s"
+                  % "   ".join("%s=0x%X" % (k, v) for k, v in r.auto.items()))
         if r.banner:
             print("镜像 banner : %s" % r.banner)
         if r.unfilled:
-            print("\n还差 %d 个手工宏（符号表里没有，必须反汇编/panic 定标）："
+            print("\n还差 %d 个手工宏（指令里读不出来，得人工定标）："
                   % len(r.unfilled))
             for m, hint in MANUAL_MACROS:
                 if m in r.unfilled:

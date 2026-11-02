@@ -355,14 +355,20 @@ python -m l5tk adapt status                  # 当前设备命中哪个 target
 所以设备没 root、手上又只有 boot 分区镜像时这条路照样走得通。
 
 能自动的：符号偏移、`target.h` 骨架、编译、设备↔target 匹配。
-不能自动的 4 个宏（结构体布局与栈帧大小，符号表里没有）：
 
-| 宏 | 怎么取 |
+另有 4 个宏不在符号表里（结构体布局与栈帧大小），但**它们就写在指令立即数上**，
+所以也是自动的 —— `core/ainsn.py` 直接扫机器码：
+
+| 宏 | 从哪读出来 |
 |---|---|
-| `WAITER_LOCAL_OFF` | `rt_mutex_waiter` 里 task 字段偏移，出厂 0x50 / 主线 0x40 |
-| `TASK_CRED_OFF` | `commit_creds` 里 `ldr x8,[x19,#0x7e0]` 的立即数 |
-| `PRCTL_FRAME_TOTAL` | `__arm64_sys_prctl` 开头的 `stp/sub sp` 指令 |
-| `PRCTL_WAITER_WORD_DEFAULT` | `PRCTL_POISON=1` 跑一次，从 `x21` 反推 |
+| `TASK_REAL_CRED_OFF` / `TASK_CRED_OFF` | `commit_creds` 头两条相邻 64 位 LDR（同基址、差 8） |
+| `PRCTL_FRAME_TOTAL` | `__arm64_sys_prctl` 的 `stp …[sp,#-N]!` 加后续 `sub sp,sp,#M` |
+| `WAITER_LOCAL_OFF` | `task_blocks_on_rt_mutex` 有没有写 `+0x48`（有 → 0x50，无 → 0x40） |
+| `PRCTL_WAITER_WORD_DEFAULT` | 只在「waiter 与帧大小都与模板一致」时推断沿用，否则留占位符 |
+
+扫不出来（指令形态不在预期内、源是 ELF、符号偏移与文件对不上）就**整体放弃**，
+退回留占位符让人 `fill` —— 宁可少填，不能填错。四个型号的 ROM 实测全部自动定标，
+值也全部与出厂模板相同。
 
 **同源构建直接继承**：镜像提出来每个宏都等于模板原值，就说明是同一份内核，
 这 4 个值自动沿用模板，`gen` 完可以直接 `build`。（`--no-inherit` 强制留占位符。）
@@ -373,19 +379,29 @@ V1 的 `%LOCALAPPDATA%\Leaf5RootTool\targets` 也读（`adapt list` 里标 `V1`�
 之前用 V1 适配过的机器不用重做。
 
 界面上是「内核适配（换固件）」那个按钮：来源自动找、候选可切、差异表显示
-哪些宏跟模板不一样、四个宏填完点编译，最后一步装进工具。
+哪些宏跟模板不一样、手工宏能自动的已经填好，点编译，最后一步装进工具。
 
 #### 四个型号 ROM 实测（2026-11-02）
 
 素材是 `firmware/_img/*.Image`：从 `.upx` 固件包里解出来的裸 ARM64 kernel，
 不接设备、不需要 root，正好能把「解析 → 生成 → 编译」整条链跑穿。
 
-| 镜像 | 内核 | 本文解码器 | 独立工具 `kallsyms-finder` | 62 宏提取 | 与模板差异 |
-|---|---|---|---|---|---|
-| Leaf5 4.2.3-rel_0928 | `4.19.157-perf-g77c132eccfab-dirty` #38 | 117,009 符号 | 117,009（同集合） | 55 个 | 10 |
-| Tab8 4.2-rel_0603 | `4.19.157-perf-ge2582afab8ec-dirty` #11 | 110,455 | — | 55 个 | 55 |
-| Tab8C 4.2-rel_0605 | 同上 commit #12 | 110,455 | — | 55 个 | 55 |
-| Tab10 4.2-rel_0630 | `4.19.157-perf-g45e1596201e0-dirty` #41 | 110,457 | 110,457（同集合） | 55 个 | 55 |
+| 镜像 | 内核 | 解出符号 | 独立工具对照 | 符号宏 | 与模板差异 | 手工宏 | 编出 so |
+|---|---|---|---|---|---|---|---|
+| Leaf5 4.2.3-rel_0928 | `g77c132eccfab-dirty` #38 | 117,009 | 117,009（同集合） | 55 | 10 | 4/4 自动 | 2,495,432 |
+| Tab8 4.2-rel_0603 | `ge2582afab8ec-dirty` #11 | 110,455 | — | 55 | 55 | 4/4 自动 | 2,495,352 |
+| Tab8C 4.2-rel_0605 | 同上 commit #12 | 110,455 | — | 55 | 55 | 4/4 自动 | 2,495,352 |
+| Tab10 4.2-rel_0630 | `g45e1596201e0-dirty` #41 | 110,457 | 110,457（同集合） | 55 | 55 | 4/4 自动 | 2,495,432 |
+
+「手工宏 4/4 自动」= 以前要人拿 IDA 对的那 4 个，现在全由指令扫描定：
+`TASK_REAL_CRED_OFF` / `TASK_CRED_OFF` 取 `commit_creds` 头两条相邻 LDR，
+`PRCTL_FRAME_TOTAL` 取 `__arm64_sys_prctl` 的降栈总量，
+`WAITER_LOCAL_OFF` 看 `task_blocks_on_rt_mutex` 有没有写 `+0x48`，
+`PRCTL_WAITER_WORD_DEFAULT` 在「waiter 与帧大小都与模板一致」时推断沿用。
+四份镜像的结论**全部与出厂模板相同**（0x7d8 / 0x7e0 / 0x200 / 0x50 / 3）——
+同一棵 ONYX 4.19 树，结构体布局没动，只有符号地址随构建漂移。
+
+同一份镜像跑两遍，`preload.so` 的 md5 逐字节相同（编译无随机性）。
 
 两组交叉验证的结论：
 
@@ -409,6 +425,22 @@ V1 的 `%LOCALAPPDATA%\Leaf5RootTool\targets` 也读（`adapt list` 里标 `V1`�
 （就是上面那个 0x640），其余指令逐条相同 —— 既证明其余 9 个差异宏确实没进代码，
 也证明适配后的偏移真的落到了代码里。
 
+**boot.img 与裸 Image 等价**：拿设备上捞出来的 `out_dump/boot_b.img`（100 MB，
+kernel 段 60,735,504 字节）走同一条流程 —— 自动切段、解出同一份 banner `#38`、
+同样的 10 个差异、同样的 4 个自动定标值，生成的 `target.h` 与裸 Image 路径
+**逐字符一致**（只有 id / LABEL / 生成头不同），编出的 so 反汇编只差常量池偏移。
+两条入口通到同一个 target。
+
+### 两个已修的坑
+
+- **target 记错内核串**：gen 的 `kernel` 原来直接借「当前连着的设备」的
+  `uname -r`。解析 Tab8 的 ROM 时，target 会被记成 Leaf5 的内核串 ——
+  `root exploit` 的内核闸就永远比不中，甚至两份不同的镜像被认成同一份。
+  现在镜像 banner 里的版本优先，只有镜像内核与设备完全一致时才沿用设备指纹。
+- **`--inherit` 与自动定标的关系**：以前 `--inherit` 是「明知有差异也照抄模板」，
+  现在是「模板值兜底，能扫的按镜像覆盖」。四份 ROM 上两者结果重合，
+  所以出厂模板对这四台都是对的；换成布局真的变过的内核时，扫描值会盖掉旧值。
+
 签名用本机证书库里 Subject 为 `CN=SWT` 的证书，按 Subject 精确匹配。
 换名字：`set L5TK_SIGN_CN=CN=你要的名字`。
 
@@ -418,7 +450,7 @@ V1 的 `%LOCALAPPDATA%\Leaf5RootTool\targets` 也读（`adapt list` 里标 `V1`�
 python -m pytest
 ```
 
-142 项。adb 与 fastboot 都是注入的假 runner，跑的是真解析逻辑，不起进程、不连设备。
+161 项。adb 与 fastboot 都是注入的假 runner，跑的是真解析逻辑，不起进程、不连设备。
 
 ## V1 → V2 未迁清单
 
