@@ -258,9 +258,44 @@ class Adb:
         except ValueError:
             return -1
 
+    # 不同超级用户实现对参数的接受方式不一样：Magisk 认 `su -c`，
+    # 一些老 ROM 的 su 只认 `su <uid> <cmd>`，KernelSU 两种都行。
+    # 只试第一条会在真机上误报「没有 root」—— Leaf5 上就出过这个。
+    SU_FORMS: tuple[tuple[str, ...], ...] = (
+        ("su", "-c", "id"),
+        ("su", "0", "id"),
+        ("su", "-c", "id -u"),
+    )
+
+    def su_probe(self, timeout: int | None = None) -> tuple[bool, str]:
+        """探测 su 能不能真提到 uid=0，返回 (可用, 失败原因)。
+
+        只返回 bool 的话，界面显示「无 root」时用户没有任何线索 ——
+        分不清是没刷、没授权、还是 su 存在但被 SELinux 挡了。
+        """
+        timeout = timeout or self.cfg.timeout_short
+        why = ""
+        for form in self.SU_FORMS:
+            r = self.sh(*form, timeout=timeout)
+            body = (r.out or "").strip()
+            if r.ok and ("uid=0" in body or body == "0"):
+                return True, ""
+            if r.timed_out:
+                # 超时基本是 Magisk 弹了授权框没人点。立刻返回，不再试其它形式 ——
+                # 三条各等一遍会白等 45 秒，而原因已经在手里了。
+                return False, ("su 调用超时（Magisk 可能在手机上弹了授权框，"
+                               "点「允许」后重新检测）")
+            elif r.rc == 127 or "not found" in r.text:
+                why = "设备上没有 su（或 su 不在 PATH 里）"
+            elif "denied" in r.text.lower() or "not allowed" in r.text.lower():
+                why = "su 存在但被拒绝：%s" % (body or r.text.splitlines()[:1])
+            elif body or r.text:
+                why = "%s → rc=%d %s" % (" ".join(form), r.rc,
+                                         (body or r.text).splitlines()[0][:80])
+        return False, why
+
     def su_available(self) -> bool:
-        r = self.sh("su", "-c", "id", timeout=self.cfg.timeout_short)
-        return r.ok and "uid=0" in r.out
+        return self.su_probe()[0]
 
     def adb_root(self) -> bool:
         """userdebug 上 adb root 能直接提权；user 版会返回 cannot run as root。"""

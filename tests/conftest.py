@@ -61,6 +61,7 @@ class FakeAdb:
 
     def __init__(self, props=None, serial="ABCD1234EFGH", state="device",
                  packages=None, top="", su=False, accounts="",
+                 su_forms=None, su_timed_out=False,
                  partitions=("boot_a", "boot_b", "vbmeta_a", "vbmeta_b")):
         self.props = dict(props or LEAF5_PROPS)
         self.serial = serial
@@ -68,6 +69,9 @@ class FakeAdb:
         self.packages = dict(packages or {})
         self.top = top
         self.su = su
+        # su=True 时默认只认 Magisk 的 `su -c`；传 su_forms 可模拟只认老式 `su 0`
+        self.su_forms = su_forms if su_forms is not None else {("su", "-c")}
+        self.su_timed_out = su_timed_out
         self.accounts = accounts
         self.partitions = tuple(partitions)
         self.calls: list[tuple[str, ...]] = []
@@ -136,10 +140,14 @@ class FakeAdb:
             return ok(argv, "Starting: Intent\nStatus: ok\n" if self.top else "Starting: Intent\n")
         if rest[:2] == ["cat", "/proc/version"]:
             return ok(argv, "Linux version 5.10.66 (build@host) #38 SMP PREEMPT\n")
-        if rest[:2] == ["su", "-c"]:
-            if not self.su:
-                return ok(argv, "su: not found\n", rc=127)
-            return ok(argv, "uid=0(root) gid=0(root)\n")
+        if rest and rest[0] == "su":
+            # 只比前两段：`su -c id` 和 `su -c "dd if=..."` 是同一形式
+            form = tuple(rest[:2])
+            if self.su_timed_out:
+                return ExecResult(argv, -1, "", "", 15000, True)
+            if self.su and form in self.su_forms:
+                return ok(argv, "uid=0(root) gid=0(root) groups=0(root) context=u:r:magisk:s0\n")
+            return ok(argv, "su: permission denied\n", rc=1)
         if rest[:2] == ["stat", "-c"]:
             return ok(argv, "67108864\n")
         return ok(argv, "")

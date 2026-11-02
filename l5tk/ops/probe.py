@@ -31,6 +31,36 @@ STORE = "com.android.vending"
 GMS = "com.google.android.gms"
 GSF = "com.google.android.gsf"
 
+# Magisk 可执行文件的位置随安装方式变。`/product/bin/magisk` 是 ONYX 这类
+# 把 su 做成软链（`/product/bin/su -> ./magisk`）的系统上真正的那份，
+# 只列 /system/bin 与 /debug_ramdisk 会漏。
+MAGISK_PATHS = ("/product/bin/magisk", "/system/bin/magisk",
+                "/debug_ramdisk/magisk", "/sbin/magisk", "magisk")
+
+
+def magisk_version(adb: Adb, timeout: int = 10) -> str:
+    """Magisk 版本串（形如 `31.1:MAGISK:R`），没有就返回空串。"""
+    for binary in MAGISK_PATHS:
+        r = adb.sh(binary, "-v", timeout=timeout)
+        if r.ok and re.match(r"^\d", r.out.strip()):
+            return "Magisk %s" % r.out.strip().splitlines()[0]
+    return ""
+
+
+def detect_root(adb: Adb, allow_adb_root: bool = True
+                ) -> tuple[bool, str, str, bool]:
+    """root 探测的唯一入口，返回 (su, 失败原因, magisk, adb_root 成功)。
+
+    「检查设备」和「检查 Root」以前各写一份，路径列表还不一样，
+    于是同一台机器上两个按钮能给出互相矛盾的结论。统一到这里。
+    """
+    su, detail = adb.su_probe()
+    magisk = magisk_version(adb)
+    adb_root = False
+    if not su and not magisk and allow_adb_root:
+        adb_root = adb.adb_root()
+    return su, detail, magisk, adb_root
+
 
 @dataclass
 class Report:
@@ -39,6 +69,7 @@ class Report:
     props: dict[str, str] = field(default_factory=dict)
     kernel: str = ""
     su: bool = False
+    su_detail: str = ""
     adb_root_ok: bool = False
     magisk: str = ""
     slot: str = ""
@@ -83,8 +114,7 @@ class Report:
             "槽位        : %s" % (self.slot or "单槽"),
             "引导锁      : flash.locked=%s  verifiedboot=%s" % (
                 self.locked or "?", self.verified_boot or "?"),
-            "Root        : %s" % ("有（%s）" % (self.magisk or "su") if self.rooted
-                                  else ("可 adb root" if self.adb_root_ok else "无")),
+            "Root        : %s" % self._root_line(),
             "GMS / GSF   : %s / %s" % (self.packages.get(GMS, "缺"),
                                        self.packages.get(GSF, "缺")),
             "Google Play : %s%s" % (
@@ -98,13 +128,22 @@ class Report:
             lines.append("注意        : " + "；".join(self.warnings))
         return "\n".join(lines)
 
+    def _root_line(self) -> str:
+        if self.rooted:
+            return "有（%s）" % (self.magisk or "su")
+        if self.adb_root_ok:
+            return "可 adb root"
+        # 「无」加一句为什么，否则用户没法判断是要刷机还是要授权
+        return "无（%s）" % self.su_detail if self.su_detail else "无"
+
     def as_dict(self) -> dict[str, Any]:
         return {
             "serial": self.serial,
             "detection": self.detection.as_dict() if self.detection else None,
             "props": dict(self.props),
             "kernel": self.kernel,
-            "root": {"su": self.su, "adb_root": self.adb_root_ok, "magisk": self.magisk},
+            "root": {"su": self.su, "adb_root": self.adb_root_ok, "magisk": self.magisk,
+                     "detail": self.su_detail},
             "slot": self.slot,
             "boot": {"flash_locked": self.locked, "verified": self.verified_boot},
             "packages": dict(self.packages),
@@ -147,10 +186,7 @@ class Prober:
 
         if deep:
             self.log.info("检查 root 能力")
-            rep.su = self.adb.su_available()
-            rep.magisk = self._magisk_version()
-            if not rep.su:
-                rep.adb_root_ok = self.adb.adb_root()
+            rep.su, rep.su_detail, rep.magisk, rep.adb_root_ok = detect_root(self.adb)
 
             self.log.info("检查 Google 账号")
             rep.google_accounts = self._accounts()
@@ -161,27 +197,26 @@ class Prober:
 
     # ---------------- 子检查 ----------------
     def _magisk_version(self) -> str:
-        """Magisk 有的版本把 magisk 放在 /debug_ramdisk，三个路径都试。"""
-        for binary in ("/system/bin/magisk", "/debug_ramdisk/magisk",
-                       "/sbin/magisk"):
-            r = self.adb.sh(binary, "-v", timeout=10)
-            if r.ok and re.match(r"^\d", r.out.strip()):
-                return "Magisk %s" % r.out.strip().splitlines()[0]
-        return ""
+        return magisk_version(self.adb)
 
     def _accounts(self) -> list[str]:
-        """dumpsys account 里的 type=com.google 账号。取不到就是取不到。"""
+        """dumpsys account 里的 type=com.google 账号。
+
+        不能按空行切块再 re.search：一台机上有多个账号时，它们挤在同一段里
+        （`Accounts: 2` 后面连续两行 Account），re.search 只拿第一个，
+        于是「有 Google 账号」被判成「无」。必须全文 findall 再按 type 过滤。
+        """
         r: ExecResult = self.adb.run("shell", "dumpsys", "account",
                                      timeout=self.adb.cfg.timeout_normal)
-        if not r.ok:
+        # dumpsys 某些服务 dump 失败时 rc 非 0，但账号段照常输出，所以看 out 不看 ok
+        if not r.out:
             return []
-        found: list[str] = []
-        for block in re.split(r"\n\s*\n", r.out):
-            if "com.google" not in block:
-                continue
-            m = re.search(r"Account \{name=([^,]+),\s*type=([^}]+)\}", block)
-            if m and "google" in m.group(2).lower():
-                found.append(m.group(1).strip())
+        found = [
+            name.strip()
+            for name, typ in re.findall(
+                r"Account \{name=([^,]+),\s*type=([^}]+)\}", r.out)
+            if "google" in typ.lower()
+        ]
         return sorted(set(found))
 
     def _sanitize(self, rep: Report) -> None:
@@ -200,3 +235,8 @@ class Prober:
             rep.warnings.append("商店已装但 GMS/GSF 不全")
         if rep.locked == "1":
             rep.warnings.append("bootloader 处于锁定状态，fastboot flash 会被拒绝")
+        # 首次 su 请求会触发 Magisk 授权框，没人点就超时 —— 这不是「没 root」，
+        # 直接报到「注意」里，免得用户按一次就以为机器没 root
+        if rep.su_detail and ("超时" in rep.su_detail or "拒绝" in rep.su_detail):
+            rep.warnings.append("su 未通过：%s；在手机上点「允许」后重新检测即可"
+                                % rep.su_detail)

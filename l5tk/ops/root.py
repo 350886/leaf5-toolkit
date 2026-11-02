@@ -17,11 +17,12 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ..core.adb import Adb
-from ..core.errors import DeviceError, ImageError
+from ..core.errors import DeviceError, ImageError, Refused
 from ..core.fastboot import Fastboot, list_boot_images
 from ..core.result import Outcome
 from ..device.models import Profile
 from ..logx import Logger
+from .probe import detect_root
 
 BOOT_MAGIC = b"ANDROID!"
 HEADER_MIN = 1632
@@ -162,24 +163,17 @@ class RootOps:
 
     # ---------------- 状态 ----------------
     def status(self) -> Outcome:
-        su = self.adb.su_available()
-        magisk = ""
-        for b in ("/system/bin/magisk", "/debug_ramdisk/magisk", "/sbin/magisk"):
-            r = self.adb.sh(b, "-v", timeout=10)
-            if r.ok and r.out.strip()[:1].isdigit():
-                magisk = "Magisk " + r.out.strip().splitlines()[0]
-                break
-        adb_root = False
-        if not su and not magisk:
-            adb_root = self.adb.adb_root()
+        su, su_detail, magisk, adb_root = detect_root(self.adb)
         locked = self.adb.getprop("ro.boot.flash.locked")
         state = "rooted" if (su or magisk) else ("adb_root" if adb_root else "none")
         return Outcome(
             ok=(state != "none"), stage=state,
             detail={"rooted": "已有 root（%s）" % (magisk or "su"),
                     "adb_root": "userdebug 可直接 adb root",
-                    "none": "当前没有 root 权限"}[state],
+                    "none": "当前没有 root 权限%s"
+                            % ("：%s" % su_detail if su_detail else "")}[state],
             data={"su": su, "magisk": magisk, "adb_root": adb_root,
+                  "su_detail": su_detail,
                   "flash_locked": locked,
                   "unlocked": locked.strip() == "0"},
         )
@@ -229,6 +223,11 @@ class RootOps:
                    wait_seconds: int = 180) -> Outcome:
         img = parse_boot(image)
         self.log.info("镜像校验通过：" + img.describe())
+
+        # dry-run 必须挡在所有真动作之前：备份会 dd 块设备并 pull，
+        # 刷入前还要 reboot 到 bootloader —— 这些都不是「只检查不动手」。
+        if self.adb.cfg.dry_run:
+            raise Refused("dry-run：镜像已校验，备份/重启/刷入均未执行")
 
         if not profile.verified and not force:
             raise DeviceError(

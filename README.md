@@ -130,6 +130,28 @@ python -m l5tk root flash magisk_patched.img
 
 备份落在 `work/`，文件名带时间戳。
 
+`--dry-run` 在**校验完镜像之后、任何真动作之前**就退出：不备份、不 reboot、不刷。
+镜像合法性照样能验，但设备一点不动。
+
+## root 判定
+
+`python -m l5tk root status` 与 `probe` 用的是同一套判定（`l5tk/ops/probe.py:detect_root`），
+不会再出现「检查设备说没有、检查 Root 说有」这种互相矛盾的结果。
+
+两条实测踩到的坑，都改成显式处理了：
+
+- **首次 `su` 可能被 Magisk 的授权框拦住**。15 秒内没在手机上点「允许」，探测就超时。
+  这时报的是「无（su 调用超时：Magisk 可能在手机上弹了授权框，点「允许」后重新检测）」
+  并进「注意」行，不再是干巴巴一个「无」——点一次允许再检测就正常。
+- **su 的参数形式不止一种**。`su -c id` 是 Magisk 的写法，老一点的 ROM 只认 `su 0 id`。
+  按顺序试三种，任一条拿到 `uid=0` 就算有 root。只试第一种会在真机上误报。
+- Magisk 可执行文件的路径也不止一处：`/product/bin/magisk`（ONYX 把 `su` 做成了它的软链）、
+  `/system/bin/magisk`、`/debug_ramdisk/magisk`、`/sbin/magisk` 依次试。
+
+Google 账号的检测同理：`dumpsys account` 里多个账号挤在同一段、中间没有空行，
+按空行切块再 `re.search` 只会取到第一个（比如「番茄免费小说」），Google 账号就被吞了。
+现在全文 `findall` 再按 `type` 过滤。
+
 ## Google Play
 
 V1 在真机上踩出来的结论，V2 当硬前提：

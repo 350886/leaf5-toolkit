@@ -87,6 +87,36 @@ def test_su_available(cfg):
     assert not Adb(cfg, runner=FakeAdb(su=False)).su_available()
 
 
+def test_su_probe_tries_legacy_form(cfg):
+    """只认 `su 0 id` 的老式 su 也要认出来 —— 只试 `su -c` 会误报没 root。"""
+    fake = FakeAdb(su=True, su_forms={("su", "0")})
+    ok_, why = Adb(cfg, runner=fake).su_probe()
+    assert ok_ and why == ""
+    # 第一条必须先试过，说明是「失败后回退」而不是碰巧
+    assert fake.calls[0][-3:] == ("su", "-c", "id")
+
+
+def test_su_probe_timeout_says_authorize(cfg):
+    """Magisk 授权框没人点 → 超时。要给「去手机上点允许」，不能只说没有 root。"""
+    ok_, why = Adb(cfg, runner=FakeAdb(su=True, su_timed_out=True)).su_probe()
+    assert not ok_
+    assert "授权框" in why
+    assert "允许" in why
+
+
+def test_su_probe_timeout_stops_early(cfg):
+    """超时后不再试其它形式，否则白等三倍超时。"""
+    fake = FakeAdb(su=True, su_timed_out=True)
+    Adb(cfg, runner=fake).su_probe()
+    assert len(fake.calls) == 1
+
+
+def test_su_probe_denied_says_denied(cfg):
+    ok_, why = Adb(cfg, runner=FakeAdb(su=False)).su_probe()
+    assert not ok_
+    assert "拒绝" in why
+
+
 def test_install_has_downgrade_flag(cfg, fake):
     a = Adb(cfg, runner=fake)
     r = a.install("x.apk")
