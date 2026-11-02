@@ -19,16 +19,14 @@ import os
 import re
 import struct
 
+from .errors import ElfError
+
 ELF_MAGIC = b"\x7fELF"
 
 SHT_SYMTAB = 2
 SHT_DYNSYM = 11
 STT_OBJECT = 1
 STT_FUNC = 2
-
-
-class ElfError(Exception):
-    pass
 
 
 # ----------------------------------------------------------------------

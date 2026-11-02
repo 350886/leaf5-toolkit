@@ -117,6 +117,13 @@ def build_parser() -> argparse.ArgumentParser:
     a3 = asub.add_parser("kallsyms", help="从设备导出 /proc/kallsyms（需要 su）")
     a3.add_argument("-o", "--out", default="")
 
+    a3b = asub.add_parser(
+        "fp", help="无 root 采集设备指纹，判断有没有现成可用的 preload.so")
+    a3b.add_argument("-o", "--out", default="", help="指纹包保存路径（.json）")
+    a3b.add_argument("--no-kallsyms", action="store_true",
+                     help="跳过 kallsyms（只取版本串，快但判断力弱）")
+    a3b.add_argument("--json", action="store_true", help="输出机器可读的 JSON")
+
     a4 = asub.add_parser("gen", help="镜像/kallsyms → targets/<id>/target.h")
     a4.add_argument("src", help="boot.img / Image / vmlinux.elf / kallsyms.txt")
     a4.add_argument("--id", default="", help="target id（默认按内核串自动起名）")
@@ -529,11 +536,15 @@ def cmd_adapt(args, log) -> int:
             print("[X] 这个文件里找不到 linux_banner —— 不是完整内核镜像")
             return RC_FAIL
         if args.device:
+            # --device 给了就按它重算，覆盖自动读到的那台
             v, why, adv = kimage.banner_match(res["image"], args.device)
             res.update(device=args.device.strip(), verdict=v, why=why, advice=adv)
-            print("\n结论：%s\n      %s" % (why, adv))
-        elif res["verdict"] == "unknown":
-            print("\n" + res["advice"])
+        # 结论必须是独立一行、不带日志时间戳：这一个词决定「能不能直接用
+        # 这份镜像生成 target.h」，藏在 INFO 日志里等于没给。
+        tag = kimage.VERDICT_TAG.get(res["verdict"], "[?]")
+        print("\n结论：%s %s" % (tag, res["why"]))
+        if res["verdict"] != "same":
+            print("      %s" % res["advice"])
         print("\n镜像 banner：%s" % res["image"])
         if res.get("device"):
             print("设备 version：%s" % res["device"])
@@ -556,6 +567,39 @@ def cmd_adapt(args, log) -> int:
               % (st["lines"], st["syms"], kimage.human_size(st["size"]), st["text"]))
         print("下一步：l5tk adapt gen \"%s\"" % path)
         return RC_OK
+
+    if act == "fp":
+        # 只读：读几个 /proc 文件 + /proc/kallsyms 的符号名，不碰设备状态。
+        # 能回答的问题只有一个：「这台机器的内核，是不是我们已经有 target 的那个」。
+        from .core import fp as fpm
+
+        try:
+            dev = fpm.collect(serial=args.serial or "", adb=cfg.adb,
+                              log=log.info,
+                              want_kallsyms=not args.no_kallsyms)
+        except L5Error as e:
+            print(e.render())
+            return RC_FAIL
+        targets = [dict(t.meta, id=t.id) for t in a.list_targets()]
+        res = fpm.match(dev, targets)
+
+        if args.json:
+            print(json.dumps({"fp": dev, "match": res}, ensure_ascii=False,
+                             indent=2))
+        else:
+            print("\n" + fpm.summary(dev))
+            tag = {"same_build": "[OK]", "same_version": "[!]",
+                   "different": "[X]", "no_target": "[?]"}.get(
+                       res["verdict"], "[?]")
+            print("\n结论：%s %s" % (tag, res["why"]))
+            print("      %s" % res["advice"])
+            if res.get("id"):
+                print("命中 target：%s" % res["id"])
+        if args.out:
+            p = fpm.save(dev, args.out)
+            print("\n指纹包：%s" % p)
+        # 只有「同一次构建」才算可以零成本直接用；其余都要人再确认
+        return RC_OK if res["verdict"] == "same_build" else RC_FAIL
 
     if act == "gen":
         if not Path(args.src).is_file():
@@ -589,6 +633,11 @@ def cmd_adapt(args, log) -> int:
             for m, hint in MANUAL_MACROS:
                 if m in r.unfilled:
                     print("  %-28s %s" % (m, hint))
+            if not r.auto:
+                # 纯 kallsyms 文本只有地址，没有机器码 —— 那 4 个值就写在
+                # 指令立即数上，没有字节可扫。这句话是省掉一次白折腾。
+                print("\n来源里没有机器码（纯符号表），所以自动定标没跑。"
+                      "同一份内核给 boot.img 或裸 Image，这 4 个值能自动扫出来。")
             print("\n填法：l5tk adapt fill %s --set TASK_CRED_OFF=0x7e0 ..." % r.tid)
         else:
             print("\n下一步：l5tk adapt build %s" % r.tid)

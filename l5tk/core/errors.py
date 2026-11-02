@@ -32,6 +32,18 @@ class ImageError(L5Error):
     """镜像文件不合法（magic 不对、截断、目标机型不匹配）。"""
 
 
+class ElfError(L5Error):
+    """符号表读不出来（没有 _text、被 strip、格式不认识）。
+
+    必须挂在 L5Error 下面：kimage / elfsyms 里的错误都该是「一句人话 +
+    一行怎么办」，不是让 CLI 打一屏 Python 堆栈。
+    """
+
+
+class FpError(L5Error):
+    """无 root 指纹采集失败（adb 不通、多台设备、/proc 读不到）。"""
+
+
 class GpError(L5Error):
     """Google Play 安装/启用失败。"""
 

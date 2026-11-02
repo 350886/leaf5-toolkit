@@ -21,6 +21,7 @@ import zlib
 from pathlib import Path
 
 from . import elfsyms
+from .errors import ImageError
 
 BOOT_MAGIC = b"ANDROID!"
 
@@ -38,10 +39,6 @@ MAGICS = [
 ]
 
 _NO_WINDOW = 0x08000000 if os.name == "nt" else 0
-
-
-class ImageError(Exception):
-    pass
 
 
 # ----------------------------------------------------------------------
@@ -367,7 +364,7 @@ def banner_check(path, adb=None, serial=None, log=None) -> dict | None:
     mine = read_kernel_banner(path)
     if not mine:
         return None
-    say("  镜像 banner: %s" % mine)
+    # banner 原文不在这里打：CLI 会带标题打一遍，这里再打就是两遍。
     dev = None
     ok, out = adb_read("/proc/version", adb=adb, serial=serial)
     if ok:
@@ -376,11 +373,9 @@ def banner_check(path, adb=None, serial=None, log=None) -> dict | None:
         return dict(image=mine, device=None, verdict="unknown",
                     why="设备没连（或 /proc/version 读不出来），只解析了镜像",
                     advice="连上设备再跑一次")
-    say("  设备 version: %s" % dev)
     v, why, adv = banner_match(mine, dev)
-    say("  %s %s" % (VERDICT_TAG[v], why))
-    if v != "same":
-        say("      %s" % adv)
+    # 判定不在这里打印：CLI 要点的是「结论：...」那一行，GUI 有自己的展示位。
+    # 两边各记一次会变成同一条信息出现两遍，反而不好读。
     return dict(image=mine, device=dev, verdict=v, why=why, advice=adv)
 
 
@@ -460,20 +455,35 @@ def grab_kallsyms(out_path, adb=None, serial=None, log=None) -> tuple[str, dict]
     ks = elfsyms.Kallsyms(out_path)
     say("  %d 字节，%d 行，有效符号 %d，零地址 %d"
         % (size, ks.total, len(ks.symbols()), ks.zeroed))
+
+    def _reject(msg: str) -> None:
+        """校验不过就把文件删掉。
+
+        留着的话它和正常导出同名同大小，`ls | head -1` 一条命令就会
+        挑中它，下一步 gen 报「一个有效地址都没有」——错在上一层，
+        却要人在下一层猜原因。
+        """
+        try:
+            os.remove(out_path)
+        except OSError:
+            pass
+        raise ImageError(msg)
+
     if size < 512 * 1024:
-        raise ImageError(
+        _reject(
             "导出只有 %d 字节，太小了。设备上 /proc/kallsyms 一般 5~7MB。\n"
             "  su 可能没拿到 root，或内核编译时关了 CONFIG_KALLSYMS。" % size)
     if ks.zeroed:
-        raise ImageError(
+        _reject(
             "有 %d/%d 条地址是 0，这份文件不能用（kptr_restrict 没关掉）。\n"
             "  设备上手动确认：\n"
             "    adb shell su -c 'cat /proc/sys/kernel/kptr_restrict'   → 想要 0\n"
             "    adb shell su -c 'head -3 /proc/kallsyms'              → 第一列不能全 0\n"
-            "  有些内核不允许改这个值，那就只能走 vmlinux.elf 那条路。"
+            "  能写时先 `su -c 'echo 0 > /proc/sys/kernel/kptr_restrict'` 再导一次；\n"
+            "  有些内核不允许改这个值，那就只能走 boot.img / vmlinux.elf 那条路。"
             % (ks.zeroed, ks.total))
     if "_text" not in ks.symbols():
-        raise ImageError("这份 kallsyms 里没有 _text，可能被裁剪过")
+        _reject("这份 kallsyms 里没有 _text，可能被裁剪过")
     base_addr = ks.symbols()["_text"][0]
     say("  _text = 0x%016X" % base_addr)
     return out_path, {"lines": ks.total, "syms": len(ks.symbols()),

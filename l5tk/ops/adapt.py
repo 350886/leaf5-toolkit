@@ -805,13 +805,22 @@ class Adapter:
                          kernel=dev.get("kernel", ""))
 
     def install(self, tid: str, so_path, meta: dict | None = None) -> Target:
-        """把编好的 preload.so 收进 targets/<tid>/，写 manifest"""
+        """把编好的 preload.so 收进 targets/<tid>/，写 manifest。
+
+        身份（kernel / fingerprint）以 **gen 时记下的镜像** 为准，不以
+        「install 那一刻连着的设备」为准。`adapt build` 传进来的是
+        device_meta()，如果让它覆盖，解析 Tab8 的 ROM 之后 build 一下，
+        target 的内核串就变成手上这台 Leaf5 的了 —— root exploit 的内核闸
+        永远比不中，两份不同镜像还会被认成同一份。
+        """
         tdir = self.targets_root / tid
         tdir.mkdir(parents=True, exist_ok=True)
         dst = tdir / "preload.so"
         shutil.copyfile(so_path, dst)
-        m = dict(meta or {})
-        # gen 阶段存下的东西并进来（install 的人不必再传一遍）
+
+        # ① 先读 gen 留下的东西当底（manifest 里有 kernel/fingerprint，
+        #    symfp.json 里有 sym_digest）
+        m: dict = {}
         for name in ("symfp.json", "manifest.json"):
             p = tdir / name
             if p.is_file():
@@ -821,6 +830,16 @@ class Adapter:
                     continue
                 for k, v in data.items():
                     m.setdefault(k, v)
+
+        # ② 再并调用方给的（设备侧）信息：只补缺，不顶掉镜像身份
+        dev = dict(meta or {})
+        for k, v in dev.items():
+            if k in ("kernel", "fingerprint") and m.get(k):
+                if m[k] != v:
+                    m.setdefault("dev_" + k, v)     # 留档：install 时连着的那台
+                continue
+            m.setdefault(k, v)
+
         m["id"] = tid
         m["so_md5"] = hashlib.md5(dst.read_bytes()).hexdigest()
         m["so_size"] = dst.stat().st_size
