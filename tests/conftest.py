@@ -62,7 +62,9 @@ class FakeAdb:
     def __init__(self, props=None, serial="ABCD1234EFGH", state="device",
                  packages=None, top="", su=False, accounts="",
                  su_forms=None, su_timed_out=False, magisk="",
-                 partitions=("boot_a", "boot_b", "vbmeta_a", "vbmeta_b")):
+                 partitions=("boot_a", "boot_b", "vbmeta_a", "vbmeta_b"),
+                 kernel="4.19.157-perf-g77c132eccfab-dirty", uptime=600,
+                 dev_su_id="", dev_su_after=0):
         self.props = dict(props or LEAF5_PROPS)
         self.serial = serial
         self.state = state
@@ -75,6 +77,14 @@ class FakeAdb:
         self.magisk = magisk
         self.accounts = accounts
         self.partitions = tuple(partitions)
+        self.kernel = kernel
+        self.uptime = uptime
+        # /data/local/tmp/su -c id 的返回；dev_su_after=N 表示前 N 次还不行
+        self.dev_su_id = dev_su_id
+        self.dev_su_after = dev_su_after
+        self.dev_su_calls = 0
+        # cat <路径> 的返回，给 exec_probe.txt 这类设备端产物用
+        self.files: dict[str, str] = {}
         self.calls: list[tuple[str, ...]] = []
         self.fail_on: set[str] = set()
         # adb root 之后 adbd 以 root 重启，`shell id` 就该是 uid=0 ——
@@ -168,6 +178,19 @@ class FakeAdb:
             if self.rooted:
                 return ok(argv, "uid=0(root) gid=0(root) groups=0(root)\n")
             return ok(argv, "uid=2000(shell) gid=2000(shell)\n")
+        if rest[:1] == ["uname"]:
+            return ok(argv, self.kernel + "\n")
+        if rest[:2] == ["cat", "/proc/uptime"]:
+            return ok(argv, "%d.00 100.00\n" % self.uptime)
+        if rest[:1] == ["cat"] and rest[1:2] and rest[1] in self.files:
+            return ok(argv, self.files[rest[1]])
+        if rest[:1] == ["md5sum"]:
+            return ok(argv, "")
+        if rest[:1] == ["/data/local/tmp/su"]:
+            self.dev_su_calls += 1
+            if self.dev_su_calls > self.dev_su_after and self.dev_su_id:
+                return ok(argv, self.dev_su_id + "\n")
+            return ok(argv, "su: not found\n", rc=1)
         if rest[:2] == ["stat", "-c"]:
             return ok(argv, "67108864\n")
         return ok(argv, "")

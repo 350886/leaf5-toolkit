@@ -25,6 +25,7 @@ from ..core.fastboot import Fastboot
 from ..core.result import Outcome
 from ..device import by_key, detect
 from ..logx import Logger
+from .exploit import ExploitOps
 from .magisk import MagiskOps
 from .root import RootOps
 
@@ -82,7 +83,8 @@ class AutoRoot:
     # ---------------- 主流程 ----------------
     def run(self, part: str | None = None, with_module: bool = False,
             reboot: bool = True, image: str | Path | None = None,
-            allow_fastboot: bool = True) -> AutoResult:
+            allow_fastboot: bool = True, force_kernel: bool = False,
+            allow_exploit: bool = True) -> AutoResult:
         steps: list[Step] = []
 
         # 0. 已经 root 就别再走一遍 —— 重复 dd 写 boot 是唯一能把好机器搞砖的操作
@@ -101,8 +103,9 @@ class AutoRoot:
         # 两个都是实质动作，不能因为「只想看看」就真做。
         if self.adb.cfg.dry_run:
             plan = ["1) adb root（userdebug 才可能成功）",
-                    "2) Magisk 设备内补丁 → dd 写回（要有 su）",
-                    "3) fastboot flash %s（要有镜像且未被裁）" % (image or "<未给镜像>")]
+                    "2) 内核 exploit（内核匹配才行；拿临时 root，重启失效）",
+                    "3) Magisk 设备内补丁 → dd 写回（要有 su；把临时 root 变持久）",
+                    "4) fastboot flash %s（要有镜像且未被裁）" % (image or "<未给镜像>")]
             steps.append(Step("plan", tried=False, ok=False,
                               detail="将依次尝试：\n     " + "\n     ".join(plan)))
             return AutoResult(True, "dry_run",
@@ -121,7 +124,23 @@ class AutoRoot:
                               detail="跳过：ro.build.type=%s，adb root 会拒绝"
                                      % (self.adb.getprop("ro.build.type") or "?")))
 
-        # 2. Magisk 设备内补丁（需要已有 su）
+        # 2. 内核 exploit —— 裸机上唯一能打破「没 root 装不了 Magisk、
+        #    装 Magisk 又要先有 root」这个循环的入口。它给的 root 是临时的，
+        #    所以成功后不返回，继续往 Magisk 走，把它变持久。
+        tmp_root = False
+        if allow_exploit:
+            try:
+                eo = ExploitOps(self.adb, self.log).run_once(force=force_kernel)
+                steps.append(Step("exploit", tried=True, ok=eo.ok,
+                                  detail=self._detail(eo)))
+                tmp_root = eo.ok
+            except L5Error as e:
+                steps.append(Step("exploit", tried=True, ok=False, detail=e.message))
+        else:
+            steps.append(Step("exploit", tried=False, ok=False,
+                              detail="跳过：--no-exploit"))
+
+        # 3. Magisk 设备内补丁（需要已有 su）
         su_ok, su_why = self.adb.su_probe()
         if su_ok:
             try:
@@ -129,8 +148,9 @@ class AutoRoot:
                     part=part, with_module=with_module, reboot=reboot)
                 steps.append(Step("magisk", tried=True, ok=o.ok, detail=self._detail(o)))
                 if o.ok:
-                    return AutoResult(True, "magisk", o.detail, steps,
-                                      {"how": "magisk_dd", **o.data})
+                    how = "exploit+magisk" if tmp_root else "magisk_dd"
+                    return AutoResult(True, how, o.detail, steps,
+                                      {"how": how, **o.data})
                 # 失败继续往下试 fastboot，但把失败原因留在 steps 里
             except Refused as e:
                 steps.append(Step("magisk", tried=True, ok=False,
@@ -142,7 +162,14 @@ class AutoRoot:
             steps.append(Step("magisk", tried=False, ok=False,
                               detail="跳过：没有 su（%s）" % (su_why or "未知")))
 
-        # 3. fastboot 兜底 —— 只有给了镜像才动
+        # exploit 拿到了临时 root 但没能持久化：这不是失败，但必须说清后果
+        if tmp_root and not su_ok:
+            return AutoResult(
+                True, "exploit_temp",
+                "已拿到临时 root（uid=0），但 Magisk 没装上 —— 重启后失效",
+                steps, {"how": "exploit", "persist": False})
+
+        # 4. fastboot 兜底 —— 只有给了镜像才动
         if image and allow_fastboot and self._fastboot_online():
             try:
                 profile, score = self._profile()
@@ -169,7 +196,7 @@ class AutoRoot:
                               detail="跳过：没给镜像路径"))
 
         # 哪条都没通：把「为什么」写成能照做的三行
-        why = ["四条路径都不成立："]
+        why = ["五条路径都不成立："]
         if locked == "1":
             why.append("  bootloader 还是锁着的（flash.locked=1），写 boot 会被拒；"
                        "先 `fastboot flashing unlock`（会清数据）")
@@ -177,5 +204,7 @@ class AutoRoot:
             why.append("  没有 su：dd 读写 boot 分区的前提不成立")
         why.append("  给一个已补丁的 boot 镜像再跑一次："
                    "l5tk root auto --image magisk_patched.img")
+        why.append("  内核版号不同的机器只有内核 exploit 一条路，"
+                   "确认要试加 --force-kernel（跑错偏移会 kernel panic）")
         detail = "\n".join(why)
         return AutoResult(False, "no_entry", detail, steps, {"how": "none"})

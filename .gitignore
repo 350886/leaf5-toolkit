@@ -14,3 +14,6 @@ assets/bin/*
 !assets/bin/.gitkeep
 assets/magisk/*.apk
 !assets/magisk/.gitkeep
+assets/payload/*
+!assets/payload/device_root.sh
+!assets/payload/.gitkeep

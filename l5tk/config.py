@@ -66,6 +66,9 @@ class Config:
     adb: str = field(default_factory=lambda: _env("ADB") or _find_bin("adb"))
     fastboot: str = field(default_factory=lambda: _env("FASTBOOT") or _find_bin("fastboot"))
     serial: str = field(default_factory=lambda: _env("SERIAL"))
+    # 独立 server 端口：内嵌 adb 与系统 adb 抢 5037 时，换一个互不干扰。
+    # 0 = 用 adb 默认（5037）
+    adb_port: int = 0
 
     # --- 目录 ---
     base_dir: Path = field(default_factory=_exe_dir)

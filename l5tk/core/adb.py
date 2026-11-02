@@ -89,6 +89,10 @@ class Adb:
     # ---------------- 底层 ----------------
     def argv(self, *args: str) -> list[str]:
         base = [self.cfg.adb]
+        port = getattr(self.cfg, "adb_port", 0)
+        if port:
+            # -P 必须在 -s 之前：adb 的全局选项要出现在子命令前
+            base += ["-P", str(port)]
         if self._serial:
             base += ["-s", self._serial]
         return base + [str(a) for a in args]

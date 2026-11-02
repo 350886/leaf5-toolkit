@@ -38,6 +38,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-v", "--version", action="version",
                    version="l5tk %s" % __version__)
     p.add_argument("--serial", help="指定设备 serial（默认取唯一在线设备）")
+    p.add_argument("--port", type=int, default=0,
+                   help="adb server 端口（默认 5037；内嵌与系统 adb 打架时换一个）")
     p.add_argument("--adb", help="adb 路径（默认内嵌 assets/bin/adb）")
     p.add_argument("--fastboot", help="fastboot 路径")
     p.add_argument("--log-plain", action="store_true", help="日志不打码（排障用）")
@@ -59,10 +61,11 @@ def build_parser() -> argparse.ArgumentParser:
     root = sub.add_parser("root", help="root 相关")
     root.add_argument("action",
                       choices=("status", "adb", "flash", "check", "part",
-                               "magisk", "auto"),
+                               "magisk", "exploit", "auto"),
                       help="status=看状态 adb=试 adb root flash=刷 boot "
                            "check=只校验镜像 part=看会刷哪个分区（只读） "
                            "magisk=装内置 Magisk App "
+                           "exploit=跑内核载荷拿临时 root "
                            "auto=一键 root（按代价从低到高依次试）")
     root.add_argument("image", nargs="?", help="flash 用的 boot 镜像")
     root.add_argument("--part", help="分区名（默认按机型档案）")
@@ -77,6 +80,12 @@ def build_parser() -> argparse.ArgumentParser:
                       help="magisk --full / auto：写回后不重启，由你自己选时机")
     root.add_argument("--no-fastboot", action="store_true",
                       help="auto：不试 fastboot 兜底（只走 adb root / dd）")
+    root.add_argument("--force-kernel", action="store_true",
+                      help="exploit/auto：内核版号不匹配也跑（偏移不对会 kernel panic）")
+    root.add_argument("--sysadmin", action="store_true",
+                      help="exploit：额外要求 CAP_SYS_ADMIN（改只读挂载需要它）")
+    root.add_argument("--force-rerun", action="store_true",
+                      help="exploit：系统已有 su 也照样跑一轮（默认跳过）")
     root.add_argument("--force", action="store_true",
                       help="档案未验证/已上锁时仍然执行")
 
@@ -96,6 +105,8 @@ def make_logger(args) -> Logger:
     cfg = load_cfg(serial=args.serial, adb=args.adb, fastboot=args.fastboot,
                    plain_log=True if args.log_plain else None,
                    dry_run=True if args.dry_run else None)
+    if getattr(args, "port", 0):
+        cfg.adb_port = args.port
     cfg.ensure_dirs()
     return Logger(cfg.log_dir, plain=cfg.plain_log, echo=not args.quiet)
 
@@ -105,6 +116,8 @@ def _ctx(args, log: Logger):
                    plain_log=True if args.log_plain else None,
                    dry_run=True if args.dry_run else None)
     cfg.ensure_dirs()
+    if getattr(args, "port", 0):
+        cfg.adb_port = args.port
     if args.serial:
         register_secret(args.serial)
     adb = Adb(cfg, args.serial or "")
@@ -251,7 +264,8 @@ def cmd_root(args, log) -> int:
             r = AutoRoot(adb, fb, log).run(
                 part=args.part, with_module=args.module,
                 reboot=not args.no_reboot, image=args.image,
-                allow_fastboot=not args.no_fastboot)
+                allow_fastboot=not args.no_fastboot,
+                force_kernel=args.force_kernel)
         except L5Error as e:
             print(e.render())
             return RC_FAIL
@@ -262,6 +276,24 @@ def cmd_root(args, log) -> int:
         if r.stage == "dry_run":
             return RC_DRYRUN
         return RC_OK if r.ok else RC_FAIL
+
+    if args.action == "exploit":
+        # 单独跑一轮：给「想自己盯着日志」的人，也是一键流程里那一步的入口
+        from .ops.exploit import ExploitOps
+        try:
+            o = ExploitOps(adb, log).run_once(
+                force=args.force_kernel, require_sysadmin=args.sysadmin,
+                force_rerun=args.force_rerun)
+        except L5Error as e:
+            print(e.render())
+            return RC_FAIL
+        print(("成功：" if o.ok else "失败：") + o.detail)
+        for r in o.reasons:
+            print("  " + r)
+        for k in ("kernel", "capeff", "bnd", "id", "log"):
+            if o.data.get(k):
+                print("  %-8s %s" % (k + ":", o.data[k]))
+        return RC_OK if o.ok else RC_FAIL
 
     if args.action == "magisk":
         # 不带 --full 只装 App；带 --full 走 V1 那条「设备内打补丁 + dd 写回」。

@@ -84,7 +84,9 @@ def _data_args(gp: bool, work: Path) -> list[str]:
     # bin 和 magisk 无条件打进普通版：adb / fastboot / Magisk APK。
     # 这三样是「双击就能用」的全部前提，少一样用户就得自己装 platform-tools，
     # 而内嵌 adb 和系统 adb 版本不一致时（server 端口抢占）排查成本很高。
-    for sub in ("bin", "magisk"):
+    # payload 是内核 exploit 的载荷（preload.so + device_root.sh）。
+    # 它绑死一个内核构建，所以按目录整套打 —— 少一个文件就只剩报错。
+    for sub in ("bin", "magisk", "payload"):
         d = ROOT / "assets" / sub
         if _has_real_file(d):
             args += ["--add-data", "%s;assets/%s" % (d, sub)]
