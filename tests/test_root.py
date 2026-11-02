@@ -8,7 +8,7 @@ import pytest
 
 from conftest import LEAF5_PROPS, FakeAdb
 from l5tk.core.adb import Adb
-from l5tk.core.errors import DeviceError, ImageError
+from l5tk.core.errors import DeviceError, ImageError, Refused, Refused
 from l5tk.core.fastboot import Fastboot
 from l5tk.core.result import ExecResult
 from l5tk.device import by_key
@@ -223,3 +223,95 @@ def test_status_no_root(cfg):
     o = _ops(cfg, NoRootAdb(su=False), FakeFb()).status()
     assert not o.ok
     assert o.stage == "none"
+
+
+# ---------------- 内置 Magisk ----------------
+
+def _cfg_with_apk(cfg, tmp_path, name: str | None = "Magisk-v31.1.apk",
+                  payload: bytes = b"PK\x03\x04fake"):
+    """把 base_dir/bundle_dir 指到临时目录，控制内置件的有无。
+
+    真实 assets/magisk 里现在确实有 APK —— 测试不能依赖这一点，
+    否则打包机上一有文件，"缺资产"那条分支就永远测不到。
+    """
+    app = tmp_path / "app"
+    d = app / "assets" / "magisk"
+    d.mkdir(parents=True)
+    if name:
+        (d / name).write_bytes(payload)
+    cfg.base_dir = app
+    cfg.bundle_dir = app
+    return cfg
+
+
+def test_magisk_apk_found(cfg, tmp_path):
+    _cfg_with_apk(cfg, tmp_path)
+    ops = _ops(cfg, FakeAdb(), FakeFb())
+    apk = ops.magisk_apk()
+    assert apk is not None
+    assert apk.name == "Magisk-v31.1.apk"
+
+
+def test_magisk_apk_missing_is_reported(cfg, tmp_path):
+    _cfg_with_apk(cfg, tmp_path, name=None)
+    adb = FakeAdb()
+    o = _ops(cfg, adb, FakeFb()).install_magisk()
+    assert not o.ok
+    assert o.stage == "no_asset"
+    assert "assets" in o.reasons[0]
+    assert not [c for c in adb.calls if "install" in c], "没资产就不该调 adb install"
+
+
+def test_install_magisk_uses_bundled_apk(cfg, tmp_path):
+    _cfg_with_apk(cfg, tmp_path)
+    adb = FakeAdb()
+    o = _ops(cfg, adb, FakeFb()).install_magisk()
+    assert o.ok, o.detail
+    assert o.stage == "installed"
+    inst = [c for c in adb.calls if "install" in c]
+    assert len(inst) == 1
+    assert inst[0][-1].endswith("Magisk-v31.1.apk")
+    # -r 必须带：重装时不带会返回 INSTALL_FAILED_ALREADY_EXISTS
+    assert "-r" in inst[0]
+    assert any("magsik" in r or "Magisk" in r for r in o.reasons)
+
+
+def test_install_magisk_no_reinstall_flag(cfg, tmp_path):
+    _cfg_with_apk(cfg, tmp_path)
+    adb = FakeAdb()
+    o = _ops(cfg, adb, FakeFb()).install_magisk(reinstall=False)
+    assert o.ok
+    inst = [c for c in adb.calls if "install" in c]
+    assert "-r" not in inst[0]
+
+
+def test_gitkeep_does_not_count_as_asset(tmp_path):
+    """空目录只放 .gitkeep 时不能当成有货 —— 否则打出缺 adb 的 EXE。"""
+    import build
+
+    d = tmp_path / "bin"
+    d.mkdir()
+    (d / ".gitkeep").write_bytes(b"")
+    assert build._has_real_file(d) is False
+    (d / "adb.exe").write_bytes(b"MZ")
+    assert build._has_real_file(d) is True
+
+
+def test_install_magisk_refused_in_dry_run(cfg, tmp_path):
+    """dry-run 不该往设备上装东西 —— 装 APK 会覆盖用户已装的同名包。"""
+    _cfg_with_apk(cfg, tmp_path)
+    cfg.dry_run = True
+    adb = FakeAdb()
+    with pytest.raises(Refused):
+        _ops(cfg, adb, FakeFb()).install_magisk()
+    assert not [c for c in adb.calls if "install" in c]
+
+
+def test_install_magisk_refused_in_dry_run(cfg, tmp_path):
+    """dry-run 不该往设备上装东西 —— 装 APK 会覆盖用户已装的同名包。"""
+    _cfg_with_apk(cfg, tmp_path)
+    cfg.dry_run = True
+    adb = FakeAdb()
+    with pytest.raises(Refused):
+        _ops(cfg, adb, FakeFb()).install_magisk()
+    assert not [c for c in adb.calls if "install" in c]

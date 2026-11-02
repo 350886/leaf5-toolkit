@@ -43,6 +43,7 @@ python -m l5tk gplay enable             # 装商店 + 拉起 + 判定
 python -m l5tk root status              # root 状态
 python -m l5tk root adb                 # 试 adb root（userdebug）
 python -m l5tk root check boot.img      # 只校验镜像，不碰设备
+python -m l5tk root magisk              # 装内置的 Magisk App
 python -m l5tk root flash boot.img      # 备份 → 刷入 → 失败自动回滚
 python -m l5tk verify                   # 逐项验收
 ```
@@ -187,8 +188,11 @@ APK 选取顺序（目录顺序即优先级，目录内取体积最大的）：
 python build.py              # 两个版本
 python build.py --no-gp      # 只有普通版
 python build.py --gp         # 只有集成版
-python build.py --sign       # 只给已有产物签名
+python build.py --sign       # 只给已有产物签名，不打包
 ```
+
+`--sign` 是「只签名」，和 `--no-gp` / `--gp` 一起写会跳过打包、只把旧产物重签一遍，
+看起来也报「已签名」。这种组合现在直接报错退出，不会静默跳过。
 
 **必须用带 tkinter 的解释器。** workbuddy 自带的 3.13 没装 tkinter，
 用它打包不会报错，但产出的 EXE 双击就闪退、一点提示都没有。
@@ -202,13 +206,41 @@ C:\Users\<你>\AppData\Local\Programs\Python\Python312\python.exe   带 Tk 8.6 +
 
 产物在 `dist/`：
 
-| 文件 | 商店 APK | 界面上有「装 Google Play」 |
-|---|---|---|
-| `Leaf5Toolkit.exe` | 不带，靠 `apk\` 目录 | 没有这一行，窗口矮 32px |
-| `Leaf5Toolkit_gplay.exe` | 内置，启动时解到临时目录 | 有 |
+| 文件 | 体积 | 商店 APK | 界面上有「装 Google Play」 |
+|---|---|---|---|
+| `Leaf5Toolkit.exe` | 25.5 MB | 不带，靠 `apk\` 目录 | 没有这一行，窗口矮 32px |
+| `Leaf5Toolkit_gplay.exe` | 64.2 MB | 内置，启动时解到临时目录 | 有 |
 
 两个版本靠包内空标记 `assets/gp_ui.on` 区分，**不看包里有没有 APK** ——
 用户往 `apk\` 丢文件是常规操作，按 APK 判断会让普通版突然长出按钮。
+
+## 内置件
+
+普通版就把这三样打进包里，双击即用，机器上不用装过 platform-tools：
+
+| 件 | 源码位置 | 未压缩 | 作用 |
+|---|---|---|---|
+| `adb.exe` + `AdbWinApi.dll` + `AdbWinUsbApi.dll` | `assets/bin/` | 8.7 MB | 与设备通信；两个 dll 必须和 adb.exe 同目录 |
+| `fastboot.exe` | `assets/bin/` | 2.2 MB | 刷 boot、读 bootloader 状态 |
+| `Magisk-v31.1.apk` | `assets/magisk/` | 10.2 MB | `root magisk` 直接装到设备 |
+
+查找顺序：**EXE 同级 `assets\` > 包内解出的 `assets\` > `PATH`**。
+同级优先是有意的：换 adb 二进制或换 Magisk 版本时，丢文件进同级目录就生效，不用重新打包。
+
+这三样二进制**不进 git**（`.gitignore` 里排掉了），clone 下来要打包时自己放进去：
+
+```bash
+cp /path/to/platform-tools/{adb.exe,fastboot.exe,AdbWinApi.dll,AdbWinUsbApi.dll} assets/bin/
+cp /path/to/Magisk-v31.1.apk assets/magisk/
+```
+
+缺了也不会打错包 —— `build.py` 只把真有文件的目录打进去，`l5tk doctor` 会报「缺失」。
+
+`l5tk doctor` 的第二列会标 `[内嵌]` 还是 `[PATH]`：
+内嵌 adb 和系统 adb 同时跑会抢 5037 端口，连不上设备时先看这一行。
+
+`root magisk` 只装 App，不代打补丁 —— 补丁要在设备上由 Magisk 自己解当前 boot、
+判机型、压 ramdisk，PC 侧重做一遍等于重写 Magisk。装完会打印接下来那两步。
 
 签名用本机证书库里 Subject 为 `CN=SWT` 的证书，按 Subject 精确匹配。
 换名字：`set L5TK_SIGN_CN=CN=你要的名字`。
@@ -219,7 +251,7 @@ C:\Users\<你>\AppData\Local\Programs\Python\Python312\python.exe   带 Tk 8.6 +
 python -m pytest
 ```
 
-67 项。adb 与 fastboot 都是注入的假 runner，跑的是真解析逻辑，不起进程、不连设备。
+96 项。adb 与 fastboot 都是注入的假 runner，跑的是真解析逻辑，不起进程、不连设备。
 
 ## 未验证项
 

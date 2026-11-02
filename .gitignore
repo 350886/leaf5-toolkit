@@ -12,3 +12,5 @@ assets/apk/*.apk
 !assets/apk/.gitkeep
 assets/bin/*
 !assets/bin/.gitkeep
+assets/magisk/*.apk
+!assets/magisk/.gitkeep

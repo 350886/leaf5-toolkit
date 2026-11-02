@@ -293,6 +293,63 @@ class RootOps:
                              "backup": str(backup_path) if backup_path else "",
                              "image": str(img.path)})
 
-    # ---------------- 候选镜像 ----------------
-    def candidates(self, folder: str | Path | None = None) -> list[Path]:
-        return list_boot_images(folder or (self.adb.cfg.base_dir / "boot"))
+    # ---------------- 内置 Magisk ----------------
+    def magisk_apk(self) -> Path | None:
+        """内置 Magisk APK 的位置。
+
+        查找顺序与 _find_bin 一致：EXE 同级 -> 打包内。
+        同级优先是为了让用户换版本（比如 Magisk 32）时不用重新打包，
+        丢一个 apk 进 assets\\magisk\\ 就生效。
+        """
+        cfg = self.adb.cfg
+        for base in (cfg.base_dir, cfg.bundle_dir):
+            d = Path(base) / "assets" / "magisk"
+            if not d.is_dir():
+                continue
+            apks = sorted(p for p in d.glob("*.apk") if p.is_file())
+            if apks:
+                return apks[0]
+        return None
+
+    def install_magisk(self, reinstall: bool = True) -> Outcome:
+        """装内置的 Magisk App，并把「下一步」写成能照做的两行。
+
+        为什么只装 App 不代打补丁：补丁要在设备上由 Magisk 自己解当前 boot、
+        判断机型、压 ramdisk，全在 App 的 native 侧；在 PC 侧重做一遍等于
+        重写 Magisk。装 App 是能自动化的那一段，剩下的交给它。
+        """
+        apk = self.magisk_apk()
+        if apk is None:
+            return Outcome(False, "no_asset",
+                           "这个构建里没有内置 Magisk APK",
+                           reasons=["把 Magisk-*.apk 放进 EXE 同级的 assets\\magisk\\，"
+                                    "或用 python build.py 重新打包"])
+
+        # 装 APK 也是「动设备」：会覆盖用户已装的同名包，dry-run 下不能做。
+        if self.adb.cfg.dry_run:
+            raise Refused("dry-run：内置 Magisk 已找到（%s），未安装" % apk.name)
+
+        pkg = "com.topjohnwu.magisk"
+        already = self.adb.installed(pkg)
+        self.log.info("内置 Magisk：%s（%.1f MB）"
+                      % (apk.name, apk.stat().st_size / 1048576.0))
+        r = self.adb.install(str(apk), allow_downgrade=None, reinstall=reinstall)
+        if not r.ok:
+            return Outcome(False, "install_failed",
+                           "Magisk 安装失败：%s" % (r.text[:200] or "无输出"),
+                           reasons=["设备上已装更高版本时会被拒，加 --no-reinstall 也会被拒",
+                                    "先 adb uninstall com.topjohnwu.magisk 再试"],
+                           data={"apk": str(apk), "was_installed": already})
+
+        ver = self.adb.version_name(pkg)
+        detail = ("Magisk %s 已装" % ver) if ver else "Magisk 已装"
+        if already:
+            detail = "Magisk 已重新安装（原版本被覆盖）"
+        return Outcome(True, "installed", detail.strip(),
+                       reasons=[
+                           "下一步（在平板上操作）：打开 Magisk → 安装 → "
+                           "选择并修补一个文件 → 选当前固件的 boot.img",
+                           "修补产物在 /sdcard/Download/magisk_patched-*.img，"
+                           "用 `l5tk root flash <文件>` 刷入当前槽位",
+                       ],
+                       data={"apk": str(apk), "was_installed": already})

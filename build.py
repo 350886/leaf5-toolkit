@@ -69,15 +69,28 @@ def gp_flag_file(out_dir: Path) -> Path:
     return p
 
 
+def _has_real_file(d: Path, pattern: str = "*") -> bool:
+    """目录里有真文件才算数。
+
+    只看 any(d.iterdir()) 会被 .gitkeep 骗到 —— 空目录也当成有货，
+    于是 --add-data 一个什么都没有的目录，打出来的 EXE 里 adb 还是缺的。
+    """
+    return d.is_dir() and any(
+        p.is_file() and p.name != ".gitkeep" for p in d.glob(pattern))
+
+
 def _data_args(gp: bool, work: Path) -> list[str]:
     args: list[str] = []
-    for sub in ("bin",):
+    # bin 和 magisk 无条件打进普通版：adb / fastboot / Magisk APK。
+    # 这三样是「双击就能用」的全部前提，少一样用户就得自己装 platform-tools，
+    # 而内嵌 adb 和系统 adb 版本不一致时（server 端口抢占）排查成本很高。
+    for sub in ("bin", "magisk"):
         d = ROOT / "assets" / sub
-        if d.is_dir() and any(d.iterdir()):
+        if _has_real_file(d):
             args += ["--add-data", "%s;assets/%s" % (d, sub)]
     if gp:
         apk_dir = ROOT / "assets" / "apk"
-        if apk_dir.is_dir() and any(apk_dir.glob("*.apk")):
+        if _has_real_file(apk_dir, "*.apk"):
             args += ["--add-data", "%s;assets/apk" % apk_dir]
         args += ["--add-data", "%s;assets" % gp_flag_file(work)]
     return args
@@ -219,6 +232,13 @@ def main() -> int:
     ap.add_argument("--no-sign", action="store_true", help="打包后不签名")
     ap.add_argument("--clean", action="store_true", help="打包前清 build/")
     a = ap.parse_args()
+
+    # --sign 是「只给 dist 里现有产物重签」，不打包。
+    # 跟 --no-gp 一起写时会静默跳过打包，看到「已签名」就当成功 —— 这是坑，
+    # 直接把这条组合拒掉。
+    if a.sign and (a.no_gp or a.gp or a.all):
+        ap.error("--sign 只签名、不打包，不能和 --no-gp/--gp/--all 同时用；"
+                 "要打包直接 `python build.py --no-gp`（默认签）")
 
     if not ENTRY.is_file():
         ENTRY.write_text(

@@ -106,7 +106,13 @@ class FakeAdb:
                 return ok(argv, props_text(self.props) + "\n")
             return self._shell(argv, args[1:])
         if head == "install":
-            self.packages["com.android.vending"] = "/data/app/~~x/vending/base.apk"
+            # 按 APK 文件名判包名：Magisk 和 Phonesky 都要能测，
+            # 写死 com.android.vending 会让 install_magisk 的用例失去意义
+            apk = str(args[-1]) if args else ""
+            low = apk.lower()
+            pkg = ("com.topjohnwu.magisk" if "magisk" in low
+                   else "com.android.vending")
+            self.packages[pkg] = "/data/app/~~x/%s/base.apk" % pkg.split(".")[-1]
             return ok(argv, "Success\n")
         if head == "pull":
             Path(args[2]).write_bytes(b"\x00" * (3 * 1024 * 1024))

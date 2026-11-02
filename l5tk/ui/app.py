@@ -95,6 +95,7 @@ class App(tk.Tk):
             actions.append(("② 装 Google Play", self.act_gplay))
         actions += [
             ("③ 检查 Root", self.act_root),
+            ("装 Magisk App", self.act_magisk),
             ("④ 刷入 boot 镜像", self.act_flash),
             ("打开日志目录", self.act_open_logs),
         ]
@@ -220,6 +221,21 @@ class App(tk.Tk):
             if not o.ok:
                 self.emit("  下一步：userdebug 机型点这里试 adb root；"
                           "user 机型走 Magisk 补 boot → ④ 刷入。", "dim")
+        self.run_async(job)
+
+    def act_magisk(self) -> None:
+        def job():
+            ops = RootOps(self.adb, self.fb, self._bridge())
+            apk = ops.magisk_apk()
+            if apk is None:
+                self.emit("× 这个构建里没有内置 Magisk APK", "err")
+                self.emit("  把 Magisk-*.apk 丢进 EXE 同级的 assets\\magisk\\ 再点一次", "dim")
+                return
+            self.emit("安装内置 %s…" % apk.name, "dim")
+            o = ops.install_magisk()
+            self.emit(("✓ " if o.ok else "× ") + o.detail, "ok" if o.ok else "err")
+            for r in o.reasons:
+                self.emit("  " + r, "dim")
         self.run_async(job)
 
     def act_flash(self) -> None:

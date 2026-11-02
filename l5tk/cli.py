@@ -57,12 +57,16 @@ def build_parser() -> argparse.ArgumentParser:
                     help="跳过 root 与账号探测（快，未 root 的设备不卡超时）")
 
     root = sub.add_parser("root", help="root 相关")
-    root.add_argument("action", choices=("status", "adb", "flash", "check", "part"),
+    root.add_argument("action",
+                      choices=("status", "adb", "flash", "check", "part", "magisk"),
                       help="status=看状态 adb=试 adb root flash=刷 boot "
-                           "check=只校验镜像 part=看会刷哪个分区（只读）")
+                           "check=只校验镜像 part=看会刷哪个分区（只读） "
+                           "magisk=装内置 Magisk App")
     root.add_argument("image", nargs="?", help="flash 用的 boot 镜像")
     root.add_argument("--part", help="分区名（默认按机型档案）")
     root.add_argument("--no-backup", action="store_true", help="跳过刷前备份")
+    root.add_argument("--no-reinstall", action="store_true",
+                      help="magisk：已装时不覆盖")
     root.add_argument("--force", action="store_true",
                       help="档案未验证/已上锁时仍然执行")
 
@@ -117,25 +121,53 @@ def cmd_devices(_args, log) -> int:
     return RC_OK
 
 
+def _bundled(cfg: Config, exe: str) -> bool:
+    """这个路径是不是从 assets/ 里解出来的（内嵌）。"""
+    try:
+        p = Path(exe).resolve()
+    except OSError:
+        return False
+    for base in (cfg.base_dir, cfg.bundle_dir):
+        try:
+            p.relative_to(Path(base).resolve() / "assets")
+            return True
+        except (ValueError, OSError):
+            continue
+    return False
+
+
 def cmd_doctor(args, log) -> int:
     cfg, adb, fb = _ctx(args, log)
     rows = []
     ok_all = True
-    for name, exe in (("adb", cfg.adb), ("fastboot", cfg.fastboot)):
+    # fastboot 的版本开关是 --version，`fastboot version` 会被当成镜像名去等设备。
+    for name, exe, vflag in (("adb", cfg.adb, "version"),
+                             ("fastboot", cfg.fastboot, "--version")):
         exists = Path(exe).is_file() or __import__("shutil").which(exe)
         ver = ""
         if exists:
             try:
-                r = adb._run([exe, "version"], 10)
+                r = adb._run([exe, vflag], 10)
                 ver = (r.out or r.err).splitlines()[0] if r.text else ""
             except L5Error as e:
                 ver = e.message
-        rows.append((name, "OK" if exists else "缺失", ver or exe))
+        tag = "[内嵌] " if _bundled(cfg, exe) else "[PATH] "
+        rows.append((name, "OK" if exists else "缺失",
+                     (tag + (ver or "")) if exists else exe))
         ok_all = ok_all and bool(exists)
 
     print("%-10s %-6s %s" % ("组件", "状态", "版本/路径"))
     for r in rows:
         print("%-10s %-6s %s" % r)
+
+    # 内嵌件单独一行：内置 adb 和系统 adb 同时跑会抢 5037 端口，
+    # 用户得先知道现在用的是哪一个。
+    apk = RootOps(adb, fb, log).magisk_apk()
+    print("%-10s %-6s %s" % (
+        "Magisk",
+        "OK" if apk else "缺失",
+        ("%s（%.1f MB）" % (apk, apk.stat().st_size / 1048576.0)) if apk
+        else "包里没带 APK，root magisk 不可用"))
 
     try:
         devs = adb.devices()
@@ -200,6 +232,13 @@ def cmd_root(args, log) -> int:
         print("  flash.locked=%s  unlocked=%s"
               % (o.data.get("flash_locked") or "?",
                  "是" if o.data.get("unlocked") else "否"))
+        return RC_OK if o.ok else RC_FAIL
+
+    if args.action == "magisk":
+        o = ops.install_magisk(reinstall=not args.no_reinstall)
+        print(("成功：" if o.ok else "失败：") + o.detail)
+        for r in o.reasons:
+            print("  " + r)
         return RC_OK if o.ok else RC_FAIL
 
     if args.action == "adb":
