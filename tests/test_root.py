@@ -139,8 +139,10 @@ def test_flash_refused_when_locked(cfg, tmp_path):
     props["ro.boot.flash.locked"] = "1"
     img = make_boot(tmp_path / "p.img")
     ops = _ops(cfg, FakeAdb(props=props, su=True), FakeFb())
+    # via=fastboot：锁定检查只属于 bootloader 那条路 —— dd 有 su 就能写，
+    # 不看 flash.locked。测锁定就必须显式指名那条通路。
     with pytest.raises(DeviceError) as e:
-        ops.flash_boot(img, by_key("leaf5"))
+        ops.flash_boot(img, by_key("leaf5"), via="fastboot")
     assert "锁定" in e.value.message
 
 
@@ -148,7 +150,8 @@ def test_flash_ok_with_backup(cfg, tmp_path):
     img = make_boot(tmp_path / "p.img")
     fb = FakeFb()
     ops = _ops(cfg, FakeAdb(su=True), fb)
-    o = ops.flash_boot(img, by_key("leaf5"), backup=True, wait_seconds=1)
+    o = ops.flash_boot(img, by_key("leaf5"), backup=True, wait_seconds=1,
+                       via="fastboot")
     # wait_for_adb 用 cfg.adb 起子进程，测试里会失败 → reboot_timeout 也算流程走完
     assert o.stage in ("flashed", "reboot_timeout"), o.stage
     # Leaf5 是 A/B，当前槽位 _b —— 必须刷 boot_b，不是 boot
@@ -211,7 +214,8 @@ def test_flash_failure_rolls_back(cfg, tmp_path):
     img = make_boot(tmp_path / "p.img")
     fb = FakeFb(first_flash_fails=True)
     ops = _ops(cfg, FakeAdb(su=True), fb)
-    o = ops.flash_boot(img, by_key("leaf5"), backup=True, wait_seconds=1)
+    o = ops.flash_boot(img, by_key("leaf5"), backup=True, wait_seconds=1,
+                       via="fastboot")
     assert o.stage == "flash_failed_rolled_back"
     assert len(fb.flashed) == 2, "第二次应当是回滚"
     assert "boot_b_backup" in fb.flashed[1][1]

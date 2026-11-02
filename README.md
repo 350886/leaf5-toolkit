@@ -19,7 +19,8 @@ ONYX BOOX 设备的一条龙运维工具。V1 是单文件 GUI，绑死 Leaf5 �
 
 V2 不搬 V1 的 9008 写 flash 那条路：那条路依赖与 SoC 匹配的 firehose programmer，
 Leaf5 是 LITO(SM6350)，Tab 系列是 BENGAL(SM6115)，V1 里那两份 programmer 在 Tab 上直接不认。
-V2 的 root 路径是 `adb root` → `Magisk 补 boot` → `fastboot 刷`，每一步都能验。
+V2 的 root 路径是 `adb root` → `Magisk 补 boot` → `dd` / `fastbootd` / `fastboot` 三条写入通路择一，
+每一步都能验。ONYX 裁了 bootloader 的 `flash`，所以 `fastbootd` 是没 root 时的主通路，见「三条写入通路」。
 
 ## 安装
 
@@ -41,12 +42,13 @@ python -m l5tk probe                    # 设备画像
 python -m l5tk probe --json --raw       # 全量 prop，便于补档案
 python -m l5tk gplay enable             # 装商店 + 拉起 + 判定
 python -m l5tk root status              # root 状态
-python -m l5tk root auto                # 一键：已root→adb root→exploit→Magisk dd→fastboot
+python -m l5tk root auto                # 一键：已root→adb root→exploit→Magisk dd→fastbootd
 python -m l5tk root exploit             # 只跑内核载荷（拿临时 root）
 python -m l5tk root adb                 # 试 adb root（userdebug）
 python -m l5tk root check boot.img      # 只校验镜像，不碰设备
 python -m l5tk root magisk              # 装内置的 Magisk App
-python -m l5tk root flash boot.img      # 备份 → 刷入 → 失败自动回滚
+python -m l5tk root flash boot.img      # 备份 → 刷入 → 失败自动回滚（--via auto/dd/fastbootd/fastboot）
+python -m l5tk root payload --ota update.zip   # 从官方 OTA 抽原厂 boot.img，不需要设备
 python -m l5tk verify                   # 逐项验收
 python -m l5tk adapt scan               # 找本机现成的内核镜像
 python -m l5tk adapt gen boot.img       # 换固件：生成 target.h
@@ -84,7 +86,8 @@ l5tk/
 │   ├── elfsyms.py     ELF / kallsyms / Image 三种符号来源统一入口
 │   ├── imageksym.py   裸 ARM64 Image 里现场反解 kallsyms
 │   ├── ndk.py         找/下/裁 NDK，给出 clang 路径
-│   └── fp.py          无 root 的内核指纹采集与匹配
+│   ├── fp.py          无 root 的内核指纹采集与匹配
+│   └── payload.py     官方 OTA 的 payload.bin 解析与抽取
 ├── device/            只回答「这是什么机器」
 │   ├── profiles.py    档案表：Leaf5 / Tab8C / Tab8 / Tab10 / Tab 家族兜底
 │   ├── detect.py      打分识别，歧义即拒绝
@@ -93,9 +96,10 @@ l5tk/
 │   ├── probe.py       一次取全，矛盾标 warning
 │   ├── gplay.py       装/拉起/判定，APK 按目录优先级选
 │   ├── root.py        boot header 校验、备份、刷入、回滚
+│   ├── fastbootd.py   userspace 写入通路（绕开 abl 的 flash handler）
 │   ├── exploit.py     内核载荷：闸 / 部署 / 起跑 / 判定
 │   ├── magisk.py      设备内打补丁 + dd 写回 + AMS 模块
-│   ├── autoroot.py    五条 root 路径按代价排序
+│   ├── autoroot.py    六条 root 路径按代价排序
 │   └── adapt.py       内核适配：target.h、三段编译、target 仓库
 └── ui/
     ├── app.py         主窗口，后台线程 + 队列，不卡界面
@@ -143,7 +147,7 @@ python -m l5tk root flash magisk_patched.img
 5. **定分区**：读设备的 `/dev/block/by-name/` 与 `ro.boot.slot_suffix`，不靠档案猜。
    实测 Leaf5 是 A/B 双槽（`boot_a` / `boot_b`，当时槽位 `b`），所以真刷会落到 `boot_b`。
    `l5tk root part` 只读，先看这一行再决定刷不刷。
-6. **刷入**：`fastboot flash <分区>`。
+6. **刷入**：按 `--via` 选通路（`dd` / `fastbootd` / `fastboot`），见下节。
 7. **失败回滚**：刷入失败立刻用备份刷回去，再重启。
 8. **等回 adb**：180 秒内没回来就报超时，不假装成功。
 
@@ -151,6 +155,58 @@ python -m l5tk root flash magisk_patched.img
 
 `--dry-run` 在**校验完镜像之后、任何真动作之前**就退出：不备份、不 reboot、不刷。
 镜像合法性照样能验，但设备一点不动。
+
+## 三条写入通路
+
+ONYX 4.2 的 abl 把 `fastboot flash` 这条 handler 裁了 —— bootloader 模式下执行
+`fastboot flash boot x.img` 一律回 `remote: 'unknown command'`，Leaf5 与三台 Tab 实测一致。
+`fastboot reboot-bootloader`、`fastboot getvar` 都还在，只删了写入。
+
+但 `fastboot reboot fastboot` 是**另一条 handler**，裁 flash 不连带裁它。它拉起的是
+**fastbootd** —— 跑在 Android 里的 userspace 守护进程（`system/core/fastbootd` + `libfastboot`），
+写入走 `OpenPartition → write(blockdev)`，**完全不经过 abl 的命令分发表**。
+Android 13 + 动态分区的设备必然带它，所以 ONYX 4.2 一定有。
+
+判定 fastbootd 只认一条：`fastboot getvar is-userspace` 回 `yes`。bootloader 模式回 `no`。
+product 名两边会重样，不能拿来判。
+
+`root flash` 的 `--via` 按代价排序：
+
+| 值 | 前提 | 代价 | 写入方式 |
+|---|---|---|---|
+| `dd` | 有 root | 不重启，写完能回读 md5 | `dd bs=1M conv=fsync` 到块设备 |
+| `fastbootd` | 无 root | `adb reboot fastboot`，10–30 秒 | fastbootd 内部 `write(blockdev)` |
+| `fastboot` | bootloader 支持 | 重启进 bootloader | `fastboot flash`（ONYX 上必失败） |
+| `auto`（默认） | — | 先探 su，探到走 `dd`，否则有设备就走 `fastbootd` | — |
+
+`dd` 那条会 `blockdev --getsize64` 比容量、写完回读 md5，不符自动回滚。
+`fastbootd` 那条进不去时，报错里列三条退路：`root exploit` + `root magisk --full`、
+`root edl`、换机型。
+
+## 取原厂 boot（不需要 root）
+
+刷 boot 要先有 boot 镜像。手上没镜像、或者刷坏了要原厂底片，用官方 OTA 抽：
+
+```bash
+python -m l5tk root payload --ota update.zip --out work/
+```
+
+`update.zip` 是 ONYX 官网的整包 OTA。包里的 `payload.bin` 是 chromiumos 的
+`update_metadata.proto` 格式（`CrAU` + 版本 + manifest 长度 + manifest + 签名 + blobs），
+工具手解 protobuf 三层，只取 `boot` / `init_boot` 一个分区。
+
+- **不整个解压**。`payload.bin` 在 zip 里是 STORED，按 zip local header 算出的绝对偏移
+  直接切片读，1.8 GB 的包只读用到的那几 MB。
+- **`init_boot` 优先**。Android 13 起 ramdisk 从 `boot` 搬到 `init_boot`，两个都在时必须打
+  `init_boot`，打 `boot` 会得到没有 ramdisk 的镜像 —— 刷上去不进系统。
+- **支持 `REPLACE` / `REPLACE_BZ` / `REPLACE_XZ` / `ZERO` / `DISCARD`**。
+  `MOVE` / `BSDIFF` / `SOURCE_COPY` / `PUFFDIFF` / `BROTLI_BSDIFF` / `ZUCCHINI` 是增量操作，
+  full OTA 里不该出现，遇到直接报错不猜。
+- **`.upx` 不能直接读**。那是 ONYX 的加密容器（随机字节开头，无魔数），要先解成 `update.zip`。
+
+四份实测（Leaf5 / Tab10 / Tab8C / Tab8）：分区数 13/12/12/12，`block_size=4096`，
+boot 全部 `100663296` 字节（96 MB），抽出后头 8 字节是 `ANDROID!`，`parse_boot` 认得。
+Leaf5 的 boot 由 48 段 `REPLACE`/`REPLACE_BZ`/`REPLACE_XZ` 拼成，1.0 秒抽完。
 
 ## root 判定
 
@@ -284,9 +340,10 @@ AMS 修复模块在界面上是「一键 Root」下面那个勾选框，**默认
 framework，同一偏移的字节必然不符 —— 那时模块会自动降级成「跳过并说明原因」，
 **不会把已经写回并校验过的 boot 判成失败**。
 
-**为什么不走 `fastboot flash`**：ONYX 的 abl 把 flash 子命令裁了，
-`fastboot flash boot_b` 实测返回 `remote: 'unknown command'`。
-所以写回只能 `dd` —— 而有 dd 权限的前提是已经 root，这条路线必须排在拿到 root 之后。
+**写回走什么**：拿到 root 之后用 `dd`（不重启、能回读 md5）。没 root 时
+`dd` 走不通、`fastboot flash` 又被 ONYX 的 abl 裁了（实测 `remote: 'unknown command'`），
+这时走 `fastbootd` —— 它跑在 Android 里，写入不经过 abl 的命令分发表。
+见「三条写入通路」与「取原厂 boot」。
 
 四个「立刻停、分区一个字节没动」的点：
 
@@ -566,7 +623,15 @@ l5tk root auto --force-rerun           # 3 临时 root，重启即恢复
 python -m pytest
 ```
 
-185 项。adb 与 fastboot 都是注入的假 runner，跑的是真解析逻辑，不起进程、不连设备。
+227 项。adb 与 fastboot 都是注入的假 runner，跑的是真解析逻辑，不起进程、不连设备。
+
+`tests/test_payload.py`（23 项）自己写了个 protobuf 编码器合成小包，逐段断言解出来是什么字节，
+覆盖 `REPLACE` / `REPLACE_BZ` / `REPLACE_XZ` 混合、`data_offset` 相对 blobs 起点、
+extents 空洞必须为零、`ZERO` / `DISCARD` 写满、zip STORED 定位、`init_boot` 优先、
+增量操作报错且不留半成品。真固件那组用例对四份 OTA 做集成验证。
+
+`tests/test_fastbootd.py`（19 项）假的不是 `Fastbootd` 类，是 **fastboot.exe 的命令行输出**，
+连 `(bootloader) is-userspace: yes` 写在 stderr 这个真实形态都照抄，跑的是真解析。
 
 ## V1 → V2 未迁清单
 
@@ -603,3 +668,7 @@ python -m pytest
   所以 `aliases` 是按常见命名推断的。拿到设备后 `probe --raw` 一条命令就能补准。
 - A11 的 `services.jar` 补丁点未知（V1 那个 `0x2b2fee` 是 A13 偏移）。
 - BENGAL 该配哪个 firehose programmer 没确定，所以 V2 不做 9008。
+- **fastbootd 写入只验到「进得去、命令发得对」，没在真机上落盘验证**。
+  `is-userspace` 判定、`partition-size` 取值、`flash` 的参数顺序都有单测，
+  但 `reboot fastboot` 之后 ONYX 的 fastbootd 会不会因为 `ro.boot.flash.locked` 拒写，
+  手上没空机器，未测。

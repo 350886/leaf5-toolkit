@@ -1,16 +1,22 @@
 """Root：状态判定 + 刷已补丁的 boot 镜像。
 
-两条写 boot 的路线，按前提选：
+三条写 boot 的路线，按「代价从低到高」排：
 
-  * `root magisk --full`（ops/magisk.py）：已经 root 时用。设备内跑 boot_patch.sh
-    生成 new-boot.img，再 dd 写回 —— ONYX 的 abl 把 `fastboot flash` 裁了，
-    `fastboot flash boot_b` 实测返回 `remote: 'unknown command'`。
-  * `root flash`（本模块）：手上已经有一个打好补丁的镜像、且设备能进 bootloader 时用。
+  * `root magisk --full`（ops/magisk.py）：已经 root 时用。设备内跑
+    boot_patch.sh 生成 new-boot.img，再 dd 写回。
+  * `root flash`（本模块）：手上已经有打好补丁的镜像时用。via=auto 时按
+    dd → fastbootd → fastboot 依次选，理由见 flash_boot 的 docstring。
+  * `root edl`（ops/edl.py）：9008 直写，不依赖 Android 与 bootloader。
+    需要与 SoC 匹配的 firehose programmer —— Leaf5 是 LITO(SM6350)，
+    Tab 系列是 BENGAL(SM6115)，两份 lito programmer 在 Tab 上不认。
 
-9008 这条不做：需要与 SoC 匹配的 firehose programmer，Leaf5 是 LITO(SM6350)，
-Tab 系列是 BENGAL(SM6115)，V1 里那两份 lito programmer 在 Tab 上直接不认。
+为什么要 fastbootd：ONYX 的 abl 把 bootloader 模式下的 `flash` handler
+裁了，`fastboot flash boot_b` 实测返回 `remote: 'unknown command'`。
+但 fastbootd 是 Android 里的 userspace 守护进程，写分区走
+OpenPartition + write(blockdev)，根本不经过 abl 的分发表。
 
-每一步都留证据，刷之前必须能备份，备份不了就不刷。
+每一步都留证据，刷之前尽量能备份；备份不了就在结果里明说「未备份」，
+而不是先假装备份、再在刷坏后没有退路。
 """
 
 from __future__ import annotations
@@ -20,7 +26,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ..core.adb import Adb
-from ..core.errors import DeviceError, ImageError, Refused
+from ..core.errors import DeviceError, ImageError, L5Error, Refused
 from ..core.fastboot import Fastboot, list_boot_images
 from ..core.result import Outcome
 from ..device.models import Profile
@@ -115,6 +121,9 @@ class RootOps:
         self.adb = adb
         self.fb = fb
         self.log = log
+        # fastbootd 只在真要写 boot 时才用到，构造它不碰设备（不发命令）。
+        from .fastbootd import Fastbootd
+        self.fbd = Fastbootd(adb, fb, log)
 
     # ---------------- 分区判定 ----------------
     def by_name(self) -> set[str]:
@@ -230,15 +239,32 @@ class RootOps:
         return local
 
     # ---------------- 刷入 ----------------
+    # ---------------- 刷入 ----------------
     def flash_boot(self, image: str | Path, profile: Profile,
                    part: str | None = None, backup: bool = True,
                    force: bool = False, timeout: int | None = None,
-                   wait_seconds: int = 180) -> Outcome:
+                   wait_seconds: int = 180, via: str = "auto",
+                   enter_seconds: int = 90) -> Outcome:
+        """把已打补丁的 boot 镜像写进设备。
+
+        via 决定走哪条通路，三条的代价与前提完全不同：
+
+          dd          有 su 就能走，不重启，写完立刻能读回校验。首选。
+          fastbootd   Android 里的 userspace fastboot。abl 把 bootloader
+                      模式的 flash handler 裁了，但 fastbootd 的写入走
+                      OpenPartition + write(blockdev)，不经过 abl 的分发表，
+                      所以这条路在 ONYX 上仍然成立。
+          fastboot    传统 bootloader 模式。ONYX 上会回 unknown command，
+                      留着它是为了别的机器、以及万一新固件把 handler 补回来。
+
+        auto 的顺序是 dd → fastbootd → fastboot：从「不用重启」排到
+        「要重启且可能被拒」，能少动一次设备就少动一次。
+        """
         img = parse_boot(image)
         self.log.info("镜像校验通过：" + img.describe())
 
-        # dry-run 必须挡在所有真动作之前：备份会 dd 块设备并 pull，
-        # 刷入前还要 reboot 到 bootloader —— 这些都不是「只检查不动手」。
+        # dry-run 必须挡在所有真动作之前：备份要 dd 块设备并 pull，
+        # 刷入前还要重启 —— 这些都不是「只检查不动手」。
         if self.adb.cfg.dry_run:
             raise Refused("dry-run：镜像已校验，备份/重启/刷入均未执行")
 
@@ -248,9 +274,227 @@ class RootOps:
                 hint="确认要刷就加 --force；刷错 boot 分区会导致设备无法开机",
             )
 
-        locked = self.adb.getprop("ro.boot.flash.locked")
         partition, why = self.resolve_partition(profile, part)
         self.log.info("目标分区：%s（%s）" % (partition, why))
+
+        plan = self.plan_via(via)
+        self.log.info("写入通路：%s" % plan)
+
+        if plan == "dd":
+            return self._flash_dd(partition, img, backup=backup,
+                                  wait_seconds=wait_seconds)
+        if plan == "fastbootd":
+            return self._flash_fastbootd(partition, img, backup=backup,
+                                         timeout=timeout, wait_seconds=wait_seconds,
+                                         enter_seconds=enter_seconds)
+        return self._flash_fastboot(partition, img, profile, backup=backup,
+                                    force=force, timeout=timeout,
+                                    wait_seconds=wait_seconds)
+
+    def plan_via(self, via: str = "auto") -> str:
+        """把 auto 解析成具体通路。显式指定的直接照办，失败由那条路自己报。"""
+        v = (via or "auto").strip().lower()
+        allowed = ("auto", "dd", "fastbootd", "fastboot")
+        if v not in allowed:
+            raise DeviceError("不认识的写入通路 %r" % via,
+                              hint="可选：" + " / ".join(allowed))
+        if v != "auto":
+            return v
+
+        try:
+            su_ok, _why = self.adb.su_probe()
+        except L5Error:
+            su_ok = False
+        if su_ok:
+            return "dd"
+
+        # 没 su：fastbootd / fastboot 都要先能看见设备。这里不探「能不能
+        # 进 fastbootd」—— 那要真发命令，放在 _flash_fastbootd 里报。
+        try:
+            adb_ok = bool(self.adb.devices())
+        except L5Error:
+            adb_ok = False
+        if adb_ok or self.fbd.devices():
+            return "fastbootd"
+        raise DeviceError(
+            "adb 与 fastboot 都没有设备",
+            hint="插 USB、开「USB 调试」；已在 fastboot 模式就确认驱动装好了")
+
+    def _part_size(self, dev: str) -> int:
+        """分区容量（字节）。读不到返回 0 —— 0 表示「不知道」，不能当 0 容量用。"""
+        r = self.adb.sh("blockdev", "--getsize64", dev, root=True)
+        if not r.ok:
+            return 0
+        try:
+            return int(r.out.strip())
+        except ValueError:
+            return 0
+
+    def _flash_dd(self, partition: str, img: BootImage, backup: bool,
+                  wait_seconds: int) -> Outcome:
+        """有 su 时直接 dd 写块设备。
+
+        dd 没有 fastboot 那层「整块写入」的原子性，写一半掉电就是半个镜像，
+        所以备份与写完回读 md5 这两件事一个都不能省。
+        """
+        dev = "/dev/block/by-name/" + partition
+        size = img.size
+        cap = self._part_size(dev)
+        if cap and size > cap:
+            raise DeviceError(
+                "镜像 %d 字节 > 分区 %s 的 %d 字节" % (size, partition, cap),
+                hint="刷进去会被截断；确认镜像与机型 / 槽位对得上")
+        if cap:
+            self.log.info("分区容量 %.1f MB，镜像 %.1f MB"
+                          % (cap / 1048576.0, size / 1048576.0))
+
+        backup_path = None
+        if backup:
+            backup_path = self.backup_boot(partition)
+
+        remote = "/data/local/tmp/l5tk_flash.img"
+        self.log.info("推送镜像到设备…")
+        p = self.adb.push(str(img.path), remote)
+        if not p.ok:
+            raise DeviceError("推送镜像失败", hint=p.text[:300])
+
+        m1: list[str] = []
+        try:
+            self.log.info("写 %s…" % partition)
+            w = self.adb.sh("dd", "if=" + remote, "of=" + dev, "bs=1M",
+                            "conv=fsync", timeout=self.adb.cfg.timeout_flash,
+                            root=True)
+            if not w.ok:
+                return self._rollback_dd(partition, backup_path,
+                                         "dd 写回失败：" + (w.text[:200] or "无输出"))
+
+            # 回读：只读前 size 字节。md5 必须等于推上去那份，
+            # 不等就是没写全（分区尾部的旧数据不会影响前 size 字节）。
+            m1 = self.adb.sh_out("md5sum", remote,
+                                 timeout=self.adb.cfg.timeout_normal, root=True).split()
+            blk = (size + 1048575) // 1048576
+            m2 = self.adb.sh_out(
+                "dd if=%s bs=1M count=%d 2>/dev/null | head -c %d | md5sum"
+                % (dev, blk, size),
+                timeout=self.adb.cfg.timeout_flash, root=True).split()
+            if m1 and m2 and m1[0] != m2[0]:
+                return self._rollback_dd(partition, backup_path,
+                                         "回读 md5 不符（%s != %s）" % (m1[0], m2[0]))
+            self.log.ok("回读 md5 一致 %s" % (m1[0] if m1 else "?"))
+        finally:
+            self.adb.sh("rm", "-f", remote, timeout=self.adb.cfg.timeout_short,
+                        root=True)
+
+        self.log.info("重启…")
+        self.adb.sh("reboot", timeout=self.adb.cfg.timeout_short, root=True)
+        back = self.fb.wait_for_adb(seconds=wait_seconds)
+        return Outcome(
+            True, "flashed_dd",
+            "已 dd 写入 %s%s；%s" % (
+                partition,
+                "（已备份）" if backup_path else "（未备份）",
+                "设备已重启并回到 adb" if back
+                else "重启后 %d 秒内没回到 adb，可能卡在开机" % wait_seconds),
+            data={"partition": partition, "via": "dd",
+                  "backup": str(backup_path) if backup_path else "",
+                  "image": str(img.path),
+                  "md5": m1[0] if m1 else ""})
+
+    def _rollback_dd(self, partition: str, backup_path, why: str) -> Outcome:
+        """写坏了立刻把备份 dd 回去。没备份就如实报，绝不假装回滚过。"""
+        if backup_path is None:
+            return Outcome(
+                False, "write_failed_no_backup",
+                "写入失败，且没有备份可回滚：" + why,
+                reasons=["先别重启 —— 设备上的 boot 现在是坏的",
+                         "刷回原厂：l5tk root flash <原厂 boot.img> --via fastbootd",
+                         "或 9008 直写：l5tk root edl --image <原厂 boot.img>"])
+        self.log.warn("写入失败，用备份回滚：%s" % backup_path)
+        remote = "/data/local/tmp/l5tk_rollback.img"
+        p = self.adb.push(str(backup_path), remote)
+        if not p.ok:
+            return Outcome(False, "rollback_failed", "回滚推送失败：" + why,
+                           reasons=[p.text[:200]])
+        dev = "/dev/block/by-name/" + partition
+        r = self.adb.sh("dd", "if=" + remote, "of=" + dev, "bs=1M", "conv=fsync",
+                        timeout=self.adb.cfg.timeout_flash, root=True)
+        self.adb.sh("rm", "-f", remote, timeout=self.adb.cfg.timeout_short, root=True)
+        if not r.ok:
+            return Outcome(False, "rollback_failed", "回滚也失败了：" + why,
+                           reasons=[r.text[:200], "备份在 %s" % backup_path])
+        return Outcome(False, "write_failed_rolled_back",
+                       "写入失败，已用备份回滚：" + why,
+                       data={"backup": str(backup_path)})
+
+    def _flash_fastbootd(self, partition: str, img: BootImage, backup: bool,
+                         timeout: int | None, wait_seconds: int,
+                         enter_seconds: int = 90) -> Outcome:
+        """fastbootd 通路。真正的理由写在 ops/fastbootd.py 顶部。"""
+        # 备份要在进 fastbootd 之前做：进去以后 adb 就断了，
+        # 而且 fastbootd 只能读分区容量、读不了内容。
+        backup_path = None
+        if backup:
+            try:
+                backup_path = self.backup_boot(partition)
+            except L5Error as e:
+                self.log.warn("刷前备份做不了：%s" % e.message)
+
+        ok, how = self.fbd.enter(seconds=enter_seconds)
+        if not ok:
+            return Outcome(
+                False, "no_fastbootd",
+                "进不了 fastbootd：%s" % how,
+                reasons=["fastbootd 进不去时，写 boot 只剩三条路：",
+                         "  1) root exploit 拿临时 root → root magisk --full（dd 写）",
+                         "  2) l5tk root edl --image <img>（9008 直写，要匹配的 programmer）",
+                         "  3) 换回一条能 fastboot flash 的固件/机型"])
+        self.log.info("已进 fastbootd（%s）" % how)
+
+        cap = self.fbd.partition_size(partition)
+        if cap and img.size > cap:
+            return Outcome(False, "image_too_big",
+                           "镜像 %d 字节 > 分区 %s 的 %d 字节"
+                           % (img.size, partition, cap),
+                           reasons=["刷进去会被截断，已中止"])
+
+        self.log.info("fastbootd 写入 %s…" % partition)
+        r, used = self.fbd.flash(partition, str(img.path), timeout=timeout)
+        if not r.ok:
+            detail = r.text.strip()[:300] or "无输出"
+            if backup_path:
+                self.log.warn("写入失败，用备份刷回")
+                rb, _u = self.fbd.flash(partition, str(backup_path), timeout=timeout)
+                if rb.ok:
+                    self.fbd.reboot()
+                    return Outcome(False, "flash_failed_rolled_back",
+                                   "fastbootd 刷入失败，已刷回备份",
+                                   reasons=[detail], data={"backup": str(backup_path)})
+            return Outcome(
+                False, "flash_failed", "fastbootd 刷入失败",
+                reasons=[detail,
+                         "常见原因：bootloader 还是锁的（fastbootd 会回 "
+                         "Device is locked）；或这台机器的 fastbootd 也被裁了"],
+                data={"backup": str(backup_path) if backup_path else "",
+                      "via": "fastbootd"})
+
+        self.fbd.reboot()
+        self.log.info("等待设备回到 adb")
+        back = self.fb.wait_for_adb(seconds=wait_seconds)
+        return Outcome(
+            True, "flashed_fastbootd",
+            "fastbootd 已写入 %s%s；%s" % (
+                used, "（已备份）" if backup_path else "（未备份）",
+                "设备已重启并回到 adb" if back
+                else "重启后 %d 秒内没回到 adb，可能卡在开机" % wait_seconds),
+            data={"partition": used, "via": "fastbootd",
+                  "backup": str(backup_path) if backup_path else "",
+                  "image": str(img.path)})
+
+    def _flash_fastboot(self, partition: str, img: BootImage, profile: Profile,
+                        backup: bool, force: bool, timeout: int | None,
+                        wait_seconds: int) -> Outcome:
+        """传统 bootloader 模式。ONYX 上这一步会回 unknown command。"""
+        locked = self.adb.getprop("ro.boot.flash.locked")
         if locked.strip() == "1" and not force:
             raise DeviceError("bootloader 是锁定的，fastboot flash 会失败",
                               hint="ro.boot.flash.locked=1；先解锁或加 --force 试")
@@ -259,7 +503,6 @@ class RootOps:
         if backup:
             backup_path = self.backup_boot(partition)
 
-        steps = []
         self.log.info("重启到 bootloader")
         self.adb.run("reboot", "bootloader", timeout=self.adb.cfg.timeout_short)
         serial = self.fb.pick()
@@ -267,7 +510,7 @@ class RootOps:
             raise DeviceError("设备没有进入 bootloader")
 
         self.log.info("刷 %s" % partition)
-        r = self.fb.flash(partition, str(image), timeout=timeout)
+        r = self.fb.flash(partition, str(img.path), timeout=timeout)
         if not r.ok:
             # 失败时立刻尝试回滚，别把设备留在半刷状态
             if backup_path:
@@ -280,19 +523,22 @@ class RootOps:
                                    reasons=[r.text.strip()[:300]],
                                    data={"backup": str(backup_path)})
             return Outcome(False, "flash_failed", "刷入失败",
-                           reasons=[r.text.strip()[:300]],
+                           reasons=[r.text.strip()[:300],
+                                    "ONYX 的 abl 裁了 flash handler 时，这条必然失败；"
+                                    "改用 --via fastbootd 或 --via dd"],
                            data={"backup": str(backup_path) if backup_path else ""})
 
         self.fb.reboot()
         self.log.info("等待设备回到 adb")
-        ok = self.fb.wait_for_adb(seconds=wait_seconds)
-        if not ok:
+        back = self.fb.wait_for_adb(seconds=wait_seconds)
+        if not back:
             return Outcome(False, "reboot_timeout",
-                           "刷入成功但 180 秒内没回到 adb，可能卡在开机动画",
+                           "刷入成功但 %d 秒内没回到 adb，可能卡在开机动画"
+                           % wait_seconds,
                            data={"backup": str(backup_path) if backup_path else "",
                                  "partition": partition})
         return Outcome(True, "flashed", "刷入完成，设备已重启",
-                       data={"partition": partition,
+                       data={"partition": partition, "via": "fastboot",
                              "backup": str(backup_path) if backup_path else "",
                              "image": str(img.path)})
 

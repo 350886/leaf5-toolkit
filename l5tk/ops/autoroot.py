@@ -1,15 +1,18 @@
 """一键 root：按「代价从低到高」逐条试，第一个成功就停。
 
-四条路径，顺序不能换：
+六条路径，顺序不能换：
 
   0. 已经有 root        → 直接返回，一个字节都不动（幂等）
   1. adb root           → userdebug 上就够，adbd 重启，不碰分区
-  2. Magisk 设备内补丁   → 已经有 su 时最快；备份 → patch → dd 写回
-  3. fastboot flash     → 只有在 1/2 都不通、且给了镜像时才试
+  2. 内核 exploit        → 拿临时 root，是打破「没 root 装不了 Magisk」的唯一入口
+  3. Magisk 设备内补丁   → 已经有 su 时最快；备份 → patch → dd 写回
+  4. fastbootd          → 不需要 su；Android 里的 userspace 写入，不经 abl
+  5. fastboot flash     → ONYX 上被裁，留着给别的机器和万一被补回来的固件
 
-为什么第 2 条排在 fastboot 前面：Leaf5 的 abl 把 `fastboot flash` 裁了
-（实测 `remote: 'unknown command'`），而 dd 需要 su。所以「有 su」的机器
-走 dd 反而更可靠；「没 su 也没解锁」的机器哪条都不通，此时不能假装成功。
+为什么 4 排在 5 前面：ONYX 的 abl 把 bootloader 模式下的 `flash` handler
+裁了（实测 `remote: 'unknown command'`），而 fastbootd 的写入是
+OpenPartition + write(blockdev)，走另一套代码，裁前者不影响后者。
+所以同样「给了镜像」，fastbootd 的成功率比 bootloader 模式高得多。
 
 一键不等于强行成功：哪条不通就报哪条的原因，并把下一步写清楚。
 """
@@ -84,7 +87,7 @@ class AutoRoot:
     def run(self, part: str | None = None, with_module: bool = False,
             reboot: bool = True, image: str | Path | None = None,
             allow_fastboot: bool = True, force_kernel: bool = False,
-            allow_exploit: bool = True) -> AutoResult:
+            allow_exploit: bool = True, enter_seconds: int = 30) -> AutoResult:
         steps: list[Step] = []
 
         # 0. 已经 root 就别再走一遍 —— 重复 dd 写 boot 是唯一能把好机器搞砖的操作
@@ -105,7 +108,9 @@ class AutoRoot:
             plan = ["1) adb root（userdebug 才可能成功）",
                     "2) 内核 exploit（内核匹配才行；拿临时 root，重启失效）",
                     "3) Magisk 设备内补丁 → dd 写回（要有 su；把临时 root 变持久）",
-                    "4) fastboot flash %s（要有镜像且未被裁）" % (image or "<未给镜像>")]
+                    "4) fastbootd 写入 %s（不需 su；绕开被裁的 abl）"
+                    % (image or "<未给镜像>"),
+                    "5) fastboot flash %s（要有镜像且未被裁）" % (image or "<未给镜像>")]
             steps.append(Step("plan", tried=False, ok=False,
                               detail="将依次尝试：\n     " + "\n     ".join(plan)))
             return AutoResult(True, "dry_run",
@@ -162,14 +167,38 @@ class AutoRoot:
             steps.append(Step("magisk", tried=False, ok=False,
                               detail="跳过：没有 su（%s）" % (su_why or "未知")))
 
-        # exploit 拿到了临时 root 但没能持久化：这不是失败，但必须说清后果
-        if tmp_root and not su_ok:
-            return AutoResult(
-                True, "exploit_temp",
-                "已拿到临时 root（uid=0），但 Magisk 没装上 —— 重启后失效",
-                steps, {"how": "exploit", "persist": False})
+        # exploit 拿到了临时 root 但没能持久化：这不是失败，但必须说清后果。
+        # 不过别在这里就收工 —— 手上还有临时 root 时设备是活的，
+        # 后面 fastbootd 那条路也许还能把持久化补上。
+        tmp_only = bool(tmp_root and not su_ok)
 
-        # 4. fastboot 兜底 —— 只有给了镜像才动
+        # 4. fastbootd —— 不需要 su，也不需要 bootloader 支持 flash。
+        #    ONYX 的 abl 裁的是 bootloader 模式下的 flash handler；
+        #    fastbootd 是 Android 里的 userspace 进程，写分区走
+        #    OpenPartition + write(blockdev)，两套实现，裁前者不影响后者。
+        if image and allow_fastboot:
+            try:
+                profile, score = self._profile()
+                # enter_seconds 有意压到 30：一键流程里让用户干等 90 秒
+                # 才说一句「进不去 fastbootd」，体验上等于卡死。30 秒进不去
+                # 的机器，基本就是不支持。
+                o = self.root.flash_boot(image, profile, part=part,
+                                         backup=False, force=False, via="fastbootd",
+                                         enter_seconds=enter_seconds)
+                steps.append(Step("fastbootd", tried=True, ok=o.ok,
+                                  detail=self._detail(o)))
+                if o.ok:
+                    return AutoResult(True, "fastbootd", self._detail(o), steps,
+                                      {"how": "fastbootd", "profile_score": score,
+                                       "backup": "none"})
+            except L5Error as e:
+                steps.append(Step("fastbootd", tried=True, ok=False, detail=e.message))
+        else:
+            steps.append(Step("fastbootd", tried=False, ok=False,
+                              detail="跳过：%s" % ("没给镜像路径" if not image
+                                                else "--no-fastboot")))
+
+        # 5. fastboot 兜底 —— 只有给了镜像才动
         if image and allow_fastboot and self._fastboot_online():
             try:
                 profile, score = self._profile()
@@ -177,7 +206,7 @@ class AutoRoot:
                 # 这条路本来就没有"刷前备份"的能力。诚实的做法是把这件事
                 # 写在 detail 里，而不是先假装备份、再在 backup_boot 里炸掉。
                 o = self.root.flash_boot(image, profile, part=part,
-                                         backup=False, force=False)
+                                         backup=False, force=False, via="fastboot")
                 steps.append(Step("fastboot", tried=True, ok=o.ok,
                                   detail=self._detail(o)))
                 if o.ok:
@@ -195,8 +224,16 @@ class AutoRoot:
             steps.append(Step("fastboot", tried=False, ok=False,
                               detail="跳过：没给镜像路径"))
 
-        # 哪条都没通：把「为什么」写成能照做的三行
-        why = ["五条路径都不成立："]
+        # 走到这里说明持久化没成：临时 root 是「能用一会儿」，
+        # 必须如实说成这个，而不是打勾说 root 成功。
+        if tmp_only:
+            return AutoResult(
+                True, "exploit_temp",
+                "已拿到临时 root（uid=0），但 Magisk 没装上 —— 重启后失效",
+                steps, {"how": "exploit", "persist": False})
+
+        # 哪条都没通：把「为什么」写成能照做的几行
+        why = ["六条路径都不成立："]
         if locked == "1":
             why.append("  bootloader 还是锁着的（flash.locked=1），写 boot 会被拒；"
                        "先 `fastboot flashing unlock`（会清数据）")
@@ -204,6 +241,8 @@ class AutoRoot:
             why.append("  没有 su：dd 读写 boot 分区的前提不成立")
         why.append("  给一个已补丁的 boot 镜像再跑一次："
                    "l5tk root auto --image magisk_patched.img")
+        why.append("  镜像可以从官方固件包里取（不用自己备份）："
+                   "l5tk root payload --ota update.zip")
         why.append("  内核版号不同的机器只有内核 exploit 一条路，"
                    "确认要试加 --force-kernel（跑错偏移会 kernel panic）")
         detail = "\n".join(why)

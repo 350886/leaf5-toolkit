@@ -37,31 +37,9 @@ def main():
     left = None
     for w in app.winfo_children():
         pass
-    # 左栏是 body 的第一个子控件；按 pack 顺序取，不靠名字
-    def find_left(w):
-        for c in w.winfo_children():
-            if isinstance(c, tk.Frame) and c.winfo_width() in (220,) :
-                return c
-            r = find_left(c)
-            if r is not None:
-                return r
-        return None
-
-    left = find_left(app)
-    if left is None:
-        # 宽度还没算出来时兜底：找挂了最多 Button 的那个 Frame
-        best, n = None, 0
-        def scan(w):
-            nonlocal best, n
-            for c in w.winfo_children():
-                if isinstance(c, tk.Frame):
-                    k = sum(1 for x in c.winfo_children()
-                            if isinstance(x, tk.ttk.Button))
-                    if k > n:
-                        best, n = c, k
-                    scan(c)
-        scan(app)
-        left = best
+    # 左栏用 App.left_frame 直接取。Canvas 里 create_window 放的窗口不在
+    # winfo_children() 里（它是 item，不是 child widget），按容器扫是扫不到的。
+    left = getattr(app, "left_frame", None)
     assert left is not None, "找不到左栏容器"
 
     kids = left.pack_slaves()
@@ -96,14 +74,25 @@ def main():
         "条件行 %d 条，覆盖 %d 个按钮 + %d 个选项" % (len(whens), len(btns), len(chks)))
     chk(all(len(t) > len("用在·") + 2 for t in whens), "没有空的「用在」行")
 
-    print("[5] 左栏内容没被窗口底部切掉")
-    # 窗口摆到屏幕外时不进主循环，winfo_rooty() 全是 0，量不了绝对位置；
-    # 改比需求高度：左栏所有子控件的 reqheight 累加 vs 窗口高。
-    # 没进主循环时 Frame 自己的 reqheight 是 1，只能按子控件累加，
-    # 每个再加 8px 估它的上下间距（按钮 4+说明 2+2）。
+    print("[5] 左栏内容放不下时能滚")
+    # 左栏挂在 Canvas 里，内容比窗口高就出滚动条 —— 判据从「装得下」改成
+    # 「装不下时有退路」。小笔记本（1366×768）上按钮 + 两行说明本来就超。
     need = sum(k.winfo_reqheight() for k in kids)
-    chk(need <= app.winfo_height(),
-        "左栏内容需 %d px ≤ 窗口高 %d" % (need, app.winfo_height()))
+
+    def find_canvas(w):
+        for c in w.winfo_children():
+            if isinstance(c, tk.Canvas):
+                return c
+            r = find_canvas(c)
+            if r is not None:
+                return r
+        return None
+
+    cv = find_canvas(app)
+    chk(cv is not None, "左栏在 Canvas 里")
+    if cv is not None:
+        has_bar = bool(cv.cget("yscrollcommand"))
+        chk(has_bar, "绑了滚动条（内容 %d px）" % need)
 
     app.destroy()
     print()

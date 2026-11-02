@@ -17,9 +17,18 @@ from l5tk.ops.autoroot import AutoRoot
 
 
 class FakeFb:
-    def __init__(self, online=False, flash_ok=True):
+    """假 fastboot 命令行。
+
+    fastbootd=False 表示这台机器的 abl 连 `reboot fastboot` 也拒 ——
+    和 bootloader 的 flash 一样被裁。ONYX 上两种裁法都可能出现，
+    所以默认就是「进不去 fastbootd」，让原有的 fastboot 用例语义不变。
+    """
+
+    def __init__(self, online=False, flash_ok=True, fastbootd=False):
         self.online = online
         self.flash_ok = flash_ok
+        self.fastbootd = fastbootd
+        self.mode = "fastbootd" if fastbootd else "bootloader"
         self.flashed: list[tuple[str, str]] = []
 
     def __call__(self, argv, timeout):
@@ -38,7 +47,20 @@ class FakeFb:
                 return ExecResult(argv, 0, "", "", 2)
             return ExecResult(argv, 0, "XYZ789\tfastboot\n", "", 2)
         if head == "getvar":
+            if args[1:2] == ["is-userspace"]:
+                v = "yes" if self.mode == "fastbootd" else "no"
+                return ExecResult(argv, 0, "",
+                                  "(bootloader) is-userspace: %s\n" % v, 2)
+            if args[1:2] and str(args[1]).startswith("partition-size:"):
+                return ExecResult(argv, 0, "",
+                                  "(bootloader) %s: 0x6000000\n" % args[1], 2)
             return ExecResult(argv, 0, "", "(bootloader) slot-count: 2\n", 2)
+        if args[:2] == ["reboot", "fastboot"]:
+            if not self.fastbootd:
+                return ExecResult(argv, 1, "",
+                                  "FAILED (remote: 'unknown command')", 3)
+            self.mode = "fastbootd"
+            return ExecResult(argv, 0, "", "", 2)
         if head == "flash":
             self.flashed.append((args[1], args[2]))
             if not self.flash_ok:
@@ -149,16 +171,29 @@ def test_fastboot_fallback_when_image_given(cfg, tmp_path):
     """user 版 + 没 su + 给了镜像：只能靠 fastboot，且要真的刷。"""
     img = _boot_image(tmp_path / "patched.img")
     fb = FakeFb(online=True)
-    r = _auto(cfg, FakeAdb(props=PROPS_USER, su=False), fb).run(image=str(img), allow_exploit=False)
+    r = _auto(cfg, FakeAdb(props=PROPS_USER, su=False), fb).run(image=str(img), allow_exploit=False, enter_seconds=1)
     assert r.ok and r.stage == "fastboot"
     assert fb.flashed and fb.flashed[0][1].endswith("patched.img")
+
+
+def test_fastbootd_used_before_fastboot(cfg, tmp_path):
+    """abl 只裁了 bootloader 的 flash、但 reboot fastboot 还在时，
+    应当走 fastbootd 并停在那一级 —— 不去碰必然失败的 fastboot。"""
+    img = _boot_image(tmp_path / "patched.img")
+    fb = FakeFb(online=True, fastbootd=True)
+    r = _auto(cfg, FakeAdb(props=PROPS_USER, su=False), fb).run(
+        image=str(img), allow_exploit=False, enter_seconds=1)
+    assert r.ok and r.stage == "fastbootd", (r.stage, r.detail)
+    assert fb.flashed and fb.flashed[0][1].endswith("patched.img")
+    steps = [s.detail for s in r.steps]
+    assert any(d.startswith("fastbootd 已写入") or "fastbootd" in d for d in steps), steps
 
 
 def test_fastboot_failure_is_reported_not_swallowed(cfg, tmp_path):
     """abl 裁掉 flash 时返回 remote: unknown command —— 这句必须原样传出来。"""
     img = _boot_image(tmp_path / "patched.img")
     fb = FakeFb(online=True, flash_ok=False)
-    r = _auto(cfg, FakeAdb(props=PROPS_USER, su=False), fb).run(image=str(img), allow_exploit=False)
+    r = _auto(cfg, FakeAdb(props=PROPS_USER, su=False), fb).run(image=str(img), allow_exploit=False, enter_seconds=1)
     assert not r.ok
     assert any("unknown command" in s.detail for s in r.steps), \
         [s.detail for s in r.steps]
@@ -167,7 +202,8 @@ def test_fastboot_failure_is_reported_not_swallowed(cfg, tmp_path):
 def test_fastboot_skipped_when_disabled(cfg):
     fb = FakeFb(online=True)
     r = _auto(cfg, FakeAdb(props=PROPS_USER, su=False), fb).run(
-        image="x.img", allow_fastboot=False, allow_exploit=False)
+        image="x.img", allow_fastboot=False, allow_exploit=False,
+        enter_seconds=1)
     assert not r.ok
     assert not fb.flashed
 

@@ -20,6 +20,7 @@ from .config import Config, load as load_cfg
 from .core.adb import Adb
 from .core.errors import AdbError, L5Error, Refused
 from .core.fastboot import Fastboot
+from .core.payload import Payload, find_ota
 from .device import all_profiles, by_key, detect, table
 from .flags import gp_ui_enabled
 from .logx import Logger, register_secret
@@ -62,15 +63,23 @@ def build_parser() -> argparse.ArgumentParser:
     root = sub.add_parser("root", help="root 相关")
     root.add_argument("action",
                       choices=("status", "adb", "flash", "check", "part",
-                               "magisk", "exploit", "auto", "edl"),
-                      help="status=看状态 adb=试 adb root flash=刷 boot（fastboot） "
+                               "magisk", "exploit", "auto", "edl", "payload"),
+                      help="status=看状态 adb=试 adb root flash=刷 boot "
                            "check=只校验镜像 part=看会刷哪个分区（只读） "
                            "magisk=装内置 Magisk App "
                            "exploit=跑内核载荷拿临时 root "
                            "auto=一键 root（按代价从低到高依次试） "
-                           "edl=9008 直写分区（fastboot 被厂商裁掉时用这个）")
+                           "edl=9008 直写分区（fastboot 被厂商裁掉时用这个） "
+                           "payload=从官方 update.zip 里抽原厂 boot 镜像")
     root.add_argument("image", nargs="?", help="flash / edl 用的 boot 镜像")
     root.add_argument("--part", help="分区名（默认按机型档案）")
+    root.add_argument("--via", default="auto",
+                      choices=("auto", "dd", "fastbootd", "fastboot"),
+                      help="flash 的写入通路。auto = 按 dd → fastbootd → "
+                           "fastboot 依次选（ONYX 的 abl 裁了 bootloader 的 "
+                           "flash，fastbootd 是另一套实现，能过）")
+    root.add_argument("--ota", help="payload：官方 update.zip 路径")
+    root.add_argument("--out", help="payload：抽出来的镜像放哪（默认 work\\boot）")
     root.add_argument("--gpt", action="store_true", help="edl：只读分区表")
     root.add_argument("--loader", help="edl：firehose programmer 路径（*_fhprg.bin）")
     root.add_argument("--no-backup", action="store_true", help="跳过刷前备份")
@@ -303,6 +312,11 @@ def cmd_probe(args, log) -> int:
 
 
 def cmd_root(args, log) -> int:
+    # payload 只解本地文件，不需要设备 —— 必须在 _ctx 之前分流，
+    # 否则没插设备会被判成环境错误，而这件事本来跟设备无关。
+    if args.action == "payload":
+        return cmd_payload(args, log)
+
     _cfg, adb, fb = _ctx(args, log)
     ops = RootOps(adb, fb, log)
 
@@ -465,13 +479,78 @@ def cmd_root(args, log) -> int:
     profile = det.profile
     log.info("机型：%s（分 %d）" % (profile.label, det.score))
     o = ops.flash_boot(args.image, profile, part=args.part,
-                       backup=not args.no_backup, force=args.force)
+                       backup=not args.no_backup, force=args.force,
+                       via=args.via)
     print(("成功：" if o.ok else "失败：") + o.detail)
     for r in o.reasons:
         print("  " + r)
+    if o.data.get("via"):
+        print("  通路：%s" % o.data["via"])
+    if o.data.get("partition"):
+        print("  分区：%s" % o.data["partition"])
     if o.data.get("backup"):
         print("  备份：" + o.data["backup"])
     return RC_OK if o.ok else RC_FAIL
+
+
+def cmd_payload(args, log) -> int:
+    """从官方 update.zip 里抽出原厂 boot。
+
+    这是「刷 boot 的镜像从哪来」的答案：不用自己备份，官方包里就有。
+    纯本地解包，不碰设备、不需要 root、不会改任何东西。
+    """
+    cfg, _adb, _fb = _ctx(args, log)
+    ota = args.ota
+    if not ota:
+        cands = find_ota(cfg.base_dir / "firmware") or find_ota(Path.cwd())
+        if not cands:
+            print("要给固件包路径：l5tk root payload --ota update.zip")
+            print("（把 update.zip 放进 EXE 同级的 firmware\\ 也能自动找到）")
+            return RC_USAGE
+        ota = str(cands[0])
+        print("自动选用：%s" % ota)
+    if not Path(ota).is_file():
+        print("找不到固件包：%s" % ota)
+        return RC_FAIL
+
+    out = Path(args.out) if args.out else (cfg.work_dir / "boot")
+    try:
+        with Payload(ota) as p:
+            print("payload v%d，%d 个分区，块 %d 字节"
+                  % (p.version, len(p.manifest.partitions),
+                     p.manifest.block_size))
+            for part in p.manifest.partitions:
+                print("  " + part.describe())
+
+            boot = p.find_boot()
+            if boot is None:
+                print("\n包里既没有 boot 也没有 init_boot")
+                return RC_FAIL
+            print("\n打补丁目标：%s（%.1f MB）"
+                  % (boot.name, boot.size / 1048576.0))
+
+            # 重定向到文件/管道时 \r 会堆成一大片，只在真终端里画进度条。
+            tty = sys.stdout.isatty()
+
+            def prog(done, total, label):
+                if tty and total:
+                    print("\r  解包 %5.1f%%  %-12s"
+                          % (done * 100.0 / total, label), end="", flush=True)
+
+            info = p.extract(boot.name,
+                             out / ("%s_stock.img" % boot.name), progress=prog)
+            if tty:
+                sys.stdout.write("\r" + " " * 40 + "\r")
+                sys.stdout.flush()
+    except L5Error as e:
+        print(e.render())
+        return RC_FAIL
+
+    print("\n已写出：%s（%.1f MB）"
+          % (info["path"], info["bytes"] / 1048576.0))
+    print("这是原厂镜像：Magisk 打补丁要的就是它，刷坏了也用它刷回来。")
+    print("下一步：l5tk root flash %s --via fastbootd" % info["path"])
+    return RC_OK
 
 
 def cmd_gplay(args, log) -> int:
