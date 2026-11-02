@@ -20,11 +20,44 @@ def _frozen() -> bool:
     return bool(getattr(sys, "frozen", False))
 
 
+def _attach_console() -> bool:
+    """从 cmd / PowerShell 启动时，把进程接回父控制台。接上了返回 True。
+
+    为什么必须做：--windowed 打包的 EXE 由 pythonw 派生，stdout 是空的。
+    没有这一步，「EDL 刷 boot」这种要跑 3-6 分钟的操作全程看不到一行进度 ——
+    输出被攒进 buffer，结束之前用户不知道卡在哪，也不知道设备正在被写。
+    """
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        k = ctypes.windll.kernel32
+        if not k.AttachConsole(-1):
+            return False
+        # 控制台默认 GBK 代码页，直接写 UTF-8 会变乱码
+        k.SetConsoleOutputCP(65001)
+        k.SetConsoleCP(65001)
+        sys.stdout = open("CONOUT$", "w", encoding="utf-8", buffering=1,
+                          errors="replace")
+        sys.stderr = open("CONOUT$", "w", encoding="utf-8", buffering=1,
+                          errors="replace")
+        return True
+    except Exception:
+        return False
+
+
 def _run_cli(argv: list[str]) -> int:
     from l5tk.cli import main as cli_main
 
     if not _frozen():
         return cli_main(argv)
+
+    # 有控制台就直连：进度要实时可见，别攒到最后弹一个框
+    if _attach_console():
+        try:
+            return cli_main(argv)
+        except SystemExit as e:      # --version / --help 走的是这条路
+            return e.code if isinstance(e.code, int) else 1
 
     buf = io.StringIO()
     old_out, old_err = sys.stdout, sys.stderr

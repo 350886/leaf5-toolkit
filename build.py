@@ -26,7 +26,7 @@ ROOT = Path(__file__).resolve().parent
 NAME = "Leaf5Toolkit"
 GP_NAME = "Leaf5Toolkit_gplay"
 SIGN_CN = "SWT"          # 证书显示名；签名时按 Subject 精确匹配
-VERSION = (2, 1, 1, 0)
+VERSION = (2, 1, 2, 0)
 COMPANY = "local"
 PRODUCT = "Leaf5 Toolkit"
 ENTRY = ROOT / "run_app.py"
@@ -95,6 +95,17 @@ def _data_args(gp: bool, work: Path) -> list[str]:
         d = ROOT / "assets" / sub
         if _has_real_file(d):
             args += ["--add-data", "%s;assets/%s" % (d, sub)]
+    # EDL 那条腿要的三样散在 assets 根：
+    #   *_fhprg.bin  firehose programmer，必须与 SoC 匹配（Leaf5=LITO）
+    #   zadig.exe    缺 WinUSB 驱动时拉起它给 05C6:9008 绑驱动
+    # 缺了不会打错包，但「EDL 刷 boot」会直接报 no_loader —— 所以在这里喊一声，
+    # 别让人打完包才发现这条腿是瘸的。
+    for f in ("lito_op_n10_fhprg.bin", "lito_moto_fhprg.bin", "zadig.exe"):
+        p = ROOT / "assets" / f
+        if p.is_file():
+            args += ["--add-data", "%s;assets" % p]
+        else:
+            print("[!] 缺 assets/%s —— 打出来的包不能走 EDL 刷 boot" % f)
     if gp:
         apk_dir = ROOT / "assets" / "apk"
         if _has_real_file(apk_dir, "*.apk"):
@@ -154,6 +165,17 @@ def build_one(name: str, gp: bool, clean: bool) -> Path | None:
         "--version-file", str(ver_file(work)),
         "--paths", str(ROOT),
     ]
+    # edlclient 住在 l5tk/core/ 下，但它的内部 import 写的是顶层名
+    # （`from edlclient.Library.x import`）。把 core 也加进 --paths，
+    # 它就以顶层包的身份被收集；edllink 运行期再把同一个目录塞进 sys.path。
+    cmd += ["--paths", str(ROOT / "l5tk" / "core")]
+    # edlclient 子模块大量是条件导入，静态分析跟不全 —— 整包收。
+    cmd += ["--collect-submodules", "edlclient"]
+    # libusb-1.0.dll 跟着 libusb_package 走；不 collect 的话运行期
+    # add_dll_directory 会落空，pyusb 报 "No backend available"
+    cmd += ["--collect-all", "libusb_package"]
+    for mod in ("edlmain", "edlclient", "usb", "serial", "docopt"):
+        cmd += ["--hidden-import", mod]
     if clean:
         cmd.append("--clean")
     icon = ROOT / "assets" / "icon.ico"

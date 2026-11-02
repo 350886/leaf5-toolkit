@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "l5tk"
-version = "2.1.1"
+version = "2.1.2"
 description = "多机型 Android 工具箱：设备画像 / Google Play / boot 刷入"
 readme = "README.md"
 requires-python = ">=3.9"

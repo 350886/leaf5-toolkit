@@ -243,18 +243,24 @@ C:\Users\<你>\AppData\Local\Programs\Python\Python312\python.exe   带 Tk 8.6 +
 | `Magisk-v31.1.apk` | `assets/magisk/` | 10.2 MB | `root magisk` 直接装到设备 |
 | `preload.so` + `device_root.sh` | `assets/payload/` | 2.4 MB | `root exploit` 的内核载荷 |
 | exploit 源码（`src/` + `targets/onyx-leaf5/target.h`） | `assets/exploit_src/` | 740 KB | 适配向导现场重编 preload.so 的原料 |
+| `lito_op_n10_fhprg.bin` | `assets/` | 748 KB | firehose programmer，EDL 刷 boot 用它进 9008 |
+| `zadig.exe` | `assets/` | 5.0 MB | 缺 WinUSB 驱动时给 05C6:9008 绑驱动 |
 
 查找顺序：**EXE 同级 `assets\` > 包内解出的 `assets\` > `PATH`**。
 同级优先是有意的：换 adb 二进制或换 Magisk 版本时，丢文件进同级目录就生效，不用重新打包。
 
-这三样二进制**不进 git**（`.gitignore` 里排掉了），clone 下来要打包时自己放进去：
+这些二进制**不进 git**（`.gitignore` 里排掉了），clone 下来要打包时自己放进去：
 
 ```bash
 cp /path/to/platform-tools/{adb.exe,fastboot.exe,AdbWinApi.dll,AdbWinUsbApi.dll} assets/bin/
 cp /path/to/Magisk-v31.1.apk assets/magisk/
+cp /path/to/lito_op_n10_fhprg.bin assets/      # 高通 firehose programmer
+cp /path/to/zadig.exe assets/                  # WinUSB 驱动安装器
 ```
 
-缺了也不会打错包 —— `build.py` 只把真有文件的目录打进去，`l5tk doctor` 会报「缺失」。
+缺了不会打错包 —— `build.py` 只把真有文件的目录打进去，并在缺 EDL 那三样时
+打印 `[!]` 警告；`l5tk doctor` 会报「缺失」。缺 programmer 时 `root edl` 报
+`no_loader`，其余功能不受影响。
 
 `l5tk doctor` 的第二列会标 `[内嵌]` 还是 `[PATH]`：
 内嵌 adb 和系统 adb 同时跑会抢 5037 端口，连不上设备时先看这一行。
@@ -314,6 +320,50 @@ python -m l5tk --dry-run root auto            # 只列会依次试哪几条，�
 第 4 条在 Leaf5 上大概率不通 —— 它的 abl 裁了 `flash` 子命令。
 「裸机（没 root、user 版、abl 也裁了 flash）」这一格靠第 2 步打破：
 **没 root 装不了 Magisk，装 Magisk 又要先有 root**，这个循环只能由内核载荷撬开。
+
+如果连内核载荷那条也不成立（换过内核、版本对不上），还有一条独立的腿：
+
+### EDL 刷 boot（9008 直写）
+
+fastboot 跑在 abl 里，厂商可以改、可以裁；9008 是 SoC 自己的 PBL/SBL 下载模式，
+走高通 Firehose 协议 —— **裁 fastboot 命令表裁不掉它**。这是「没 root 又要写 boot」
+时唯一剩下的通道。
+
+```bash
+python -m l5tk root edl                          # 只看状态：9008 在不在、驱动、programmer
+python -m l5tk root edl --gpt                    # 读分区表（只读）
+python -m l5tk root edl --image magisk_patched.img          # 写 boot_b
+python -m l5tk root edl --image p.img --part boot_a         # 指定槽位
+```
+
+界面里是「EDL 刷 boot（9008）」。顺序固定，每步不成立就停、分区一个字节不动：
+
+```
+1. 分区必须在 GPT 里，容量必须装得下镜像
+2. 先读一份原分区到 PC，长度必须等于 GPT 里记的 length
+3. 写
+4. 读回镜像长度那一段，sha256 与源文件逐字节比对
+5. 第 4 步不符 → 用第 2 步的备份写回去，报 readback_mismatch_rolled_back
+6. reset 让设备离开下载模式（屏幕全黑时只能这么退出来）
+```
+
+第 2 步的长度校验不是形式：备份读不满说明 USB 在掉包，这时写进去出事就没有退路。
+
+**programmer 必须与 SoC 匹配**，这是硬门槛：
+
+| 机型 | SoC | 需要的 programmer | 仓库里有吗 |
+|---|---|---|---|
+| Leaf5 | LITO (SM6350) | `lito_op_n10_fhprg.bin` | ✅ 已内置，实测通过 |
+| Tab8 / Tab8C / Tab10 | BENGAL (SM6115) | bengal 的 `*_fhprg.bin` | ❌ 没有，握手就超时 |
+
+拿错 programmer 的表现不是「友好报错」，而是 Sahara 握手阶段设备不应答、最后超时。
+所以 `root edl` 会把「缺 programmer」和「握手失败」分成两个 stage，后者直接提示
+SoC 可能不是 LITO。给 Tab 三台补一份 bengal programmer（放 `assets/`，或 `--loader` 指定）
+就能走同一条路，代码不用改。
+
+分区按 `ro.boot.slot_suffix` 自动判（这四台都是 A/B，当前槽位 b ⇒ `boot_b`）。
+备份与读回副本落在 `work/stock_boot_b_<时间戳>.img` 和 `readback_boot_b_<时间戳>.img`，
+两个都留 —— 只留一个的话，出问题时分不清是「写错了」还是「读错了」。
 
 ### 内核 exploit
 
@@ -516,7 +566,7 @@ l5tk root auto --force-rerun           # 3 临时 root，重启即恢复
 python -m pytest
 ```
 
-173 项。adb 与 fastboot 都是注入的假 runner，跑的是真解析逻辑，不起进程、不连设备。
+185 项。adb 与 fastboot 都是注入的假 runner，跑的是真解析逻辑，不起进程、不连设备。
 
 ## V1 → V2 未迁清单
 

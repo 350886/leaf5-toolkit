@@ -62,14 +62,17 @@ def build_parser() -> argparse.ArgumentParser:
     root = sub.add_parser("root", help="root 相关")
     root.add_argument("action",
                       choices=("status", "adb", "flash", "check", "part",
-                               "magisk", "exploit", "auto"),
-                      help="status=看状态 adb=试 adb root flash=刷 boot "
+                               "magisk", "exploit", "auto", "edl"),
+                      help="status=看状态 adb=试 adb root flash=刷 boot（fastboot） "
                            "check=只校验镜像 part=看会刷哪个分区（只读） "
                            "magisk=装内置 Magisk App "
                            "exploit=跑内核载荷拿临时 root "
-                           "auto=一键 root（按代价从低到高依次试）")
-    root.add_argument("image", nargs="?", help="flash 用的 boot 镜像")
+                           "auto=一键 root（按代价从低到高依次试） "
+                           "edl=9008 直写分区（fastboot 被厂商裁掉时用这个）")
+    root.add_argument("image", nargs="?", help="flash / edl 用的 boot 镜像")
     root.add_argument("--part", help="分区名（默认按机型档案）")
+    root.add_argument("--gpt", action="store_true", help="edl：只读分区表")
+    root.add_argument("--loader", help="edl：firehose programmer 路径（*_fhprg.bin）")
     root.add_argument("--no-backup", action="store_true", help="跳过刷前备份")
     root.add_argument("--no-reinstall", action="store_true",
                       help="magisk：已装时不覆盖")
@@ -402,6 +405,52 @@ def cmd_root(args, log) -> int:
         print(o.detail)
         for r in o.reasons:
             print("  " + r)
+        return RC_OK if o.ok else RC_FAIL
+
+    # edl：9008 直写。fastboot 被 ONYX 的 abl 裁掉了，这是替代通道。
+    if args.action == "edl":
+        from .ops.edl import EdlOps
+        eo = EdlOps(adb, log, loader=args.loader)
+        if args.gpt:
+            o = eo.gpt()
+            head = ("成功：" if o.ok else "失败：") + o.detail
+            print(head)
+            log.info(head)
+            for r in o.reasons:
+                print("  " + r)
+                log.info("  " + r)
+            for n, v in (o.data.get("parts") or {}).items():
+                line = ("  %-22s off=0x%09X len=0x%09X %s"
+                        % (n, v["offset"], v["length"],
+                           "ACTIVE" if v.get("active") else ""))
+                print(line)
+            return RC_OK if o.ok else RC_FAIL
+        if not args.image:
+            o = eo.status()
+            head = ("就绪：" if o.ok else "未就绪：") + o.detail
+            print(head)
+            log.info(head)
+            for r in o.reasons:
+                print("  " + r)
+                log.info("  " + r)
+            print("\n写 boot：l5tk root edl --image <magisk_patched.img> [--part boot_b]")
+            print("读分区表：l5tk root edl --gpt")
+            return RC_OK if o.ok else RC_FAIL
+        o = eo.flash(args.image, part=args.part, backup=not args.no_backup)
+        head = ("成功：" if o.ok else "失败：") + o.detail
+        print(head)
+        # 结论同时落日志：--windowed 的 EXE 在部分终端接不上控制台，
+        # 日志是唯一能事后确认「到底写了没有、校验过没过」的地方
+        log.info(head)
+        for r in o.reasons:
+            print("  " + r)
+            log.info("  " + r)
+        if o.data.get("backup"):
+            print("  备份：" + o.data["backup"])
+            log.info("  备份：" + o.data["backup"])
+        if o.data.get("readback"):
+            print("  读回：" + o.data["readback"])
+            log.info("  读回：" + o.data["readback"])
         return RC_OK if o.ok else RC_FAIL
 
     # flash

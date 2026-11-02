@@ -35,13 +35,19 @@ BG = "#1e1f22"
 PANEL = "#2b2d30"
 FG = "#d7d9dd"
 MUTED = "#8b8f96"
+# 比 MUTED 再暗一档，专门给「用在什么情况」那类条件说明用：
+# 两行说明如果同样亮度，会糊成一整段，用户分不出哪句是使用条件。
+DIM = "#7a7f86"
 ACCENT = "#4c9aff"
 OK = "#4ec9a0"
 WARN = "#e2b341"
 ERR = "#ef6b6b"
 
 W = 900
-H = 720 if gp_ui_enabled() else 688   # 少一行按钮就矮 32px，不留空档
+# 每个按钮多了「用在」那一行，左栏比原来高约 8×14px；窗口跟着长高，
+# 否则日志区被挤成一条缝 —— 日志是本工具唯一的事后证据。
+# 又多了一个「EDL 刷 boot」入口（fastboot 在 ONYX 上被裁，得留替代通道）。
+H = 858 if gp_ui_enabled() else 830
 
 
 class App(tk.Tk):
@@ -95,21 +101,56 @@ class App(tk.Tk):
         left.pack_propagate(False)
 
         self.btns: list[ttk.Button] = []
-        actions = [("① 检测设备", self.act_probe)]
+        # (按钮文案, 回调, 做什么, 什么情况下用)。
+        # 每项两句，缺一不可：第一句说「点下去发生什么 / 前置条件」，第二句说
+        # 「什么时候该点这个、什么时候不该点」。只写功能名等于把判断留给用户，
+        # 而用户面对八个按钮时最缺的恰恰是那个判断。
+        actions = [("① 检测设备", self.act_probe,
+                    "读型号 / 内核 / root，只读",
+                    "刚连上设备、或换了机器")]
         if gp_ui_enabled():
-            actions.append(("② 装 Google Play", self.act_gplay))
+            actions.append(("② 装 Google Play", self.act_gplay,
+                            "需先登录 Google 账号并通过验证",
+                            "商店打不开、桌面没图标"))
         actions += [
-            ("③ 检查 Root", self.act_root),
-            ("一键 Root", self.act_autoroot),
-            ("装 Magisk App", self.act_magisk),
-            ("④ 刷入 boot 镜像", self.act_flash),
-            ("内核适配（换固件）", self.act_adapt),
-            ("打开日志目录", self.act_open_logs),
+            ("③ 检查 Root", self.act_root,
+             "su / Magisk / SELinux / 槽位",
+             "不确定现在有没有 root"),
+            ("一键 Root", self.act_autoroot,
+             "已 root→adb→exploit→Magisk",
+             "第一次用，想一把过"),
+            ("装 Magisk App", self.act_magisk,
+             "只装 App，不写 boot 分区",
+             "已有 root，只缺管理器"),
+            ("④ 刷入 boot 镜像", self.act_flash,
+             "fastboot 写入补丁好的 img",
+             "bootloader 能进、且没被裁"),
+            ("EDL 刷 boot（9008）", self.act_edl_flash,
+             "9008 直写分区，先备份再写",
+             "fastboot 刷不进去时"),
+            ("内核适配（换固件）", self.act_adapt,
+             "解内核符号 → 编 preload.so",
+             "OTA 升级、换 ROM 后"),
+            ("打开日志目录", self.act_open_logs,
+             "排障用，日志默认已脱敏",
+             "任何一步失败、要贴日志"),
         ]
-        for text, cmd in actions:
+        for text, cmd, hint, when in actions:
             b = ttk.Button(left, text=text, command=cmd)
-            b.pack(fill="x", pady=4)
+            b.pack(fill="x", pady=(4, 0))
             self.btns.append(b)
+            # 第一行：做什么。ONYX 在 framework 层拦商店，判据是 MMKV 里的
+            # gms_enable，而那个值只在账号验证通过的那一刻由系统自己写 ——
+            # 不登录就永远停在 need_login，这条前置条件必须摆在按钮上。
+            tk.Label(left, text=hint, bg=BG, fg=MUTED, font=("Segoe UI", 9),
+                     justify="left", anchor="w", wraplength=190).pack(
+                fill="x", padx=(10, 0), pady=(2, 0))
+            # 第二行：什么时候用。压一层灰、加「用在」前缀，跟第一行区分开 ——
+            # 两行同样亮度会糊成一段话，用户读不出哪句是条件。
+            tk.Label(left, text="用在·" + when, bg=BG, fg=DIM,
+                     font=("Segoe UI", 8),
+                     justify="left", anchor="w", wraplength=190).pack(
+                fill="x", padx=(10, 0), pady=(0, 2))
             if text == "一键 Root":
                 # 紧跟着一键按钮摆，不塞到列表末尾 —— 它是这条链的选项，
                 # 不是独立动作。默认勾上，理由见 __init__ 里那段注释。
@@ -120,7 +161,13 @@ class App(tk.Tk):
                     activebackground=BG, activeforeground=FG,
                     font=("Segoe UI", 9), anchor="w",
                     highlightthickness=0, bd=0, padx=0)
-                self.chk_module.pack(fill="x", padx=(10, 0), pady=(0, 4))
+                self.chk_module.pack(fill="x", padx=(10, 0), pady=(2, 0))
+                # 选项也要交代使用条件：这个框默认勾着，用户要知道「什么时候
+                # 该取消」。答案只有一种 —— Magisk App 能正常打开时它是多余的。
+                tk.Label(left, text="用在·Magisk App 点开闪退（ONYX 的 AMS 有 NPE）",
+                         bg=BG, fg=DIM, font=("Segoe UI", 8),
+                         justify="left", anchor="w", wraplength=190).pack(
+                    fill="x", padx=(10, 0), pady=(0, 4))
 
         ttk.Separator(left, orient="horizontal").pack(fill="x", pady=10)
         tk.Label(left, text="机型档案", bg=BG, fg=MUTED,
@@ -306,6 +353,47 @@ class App(tk.Tk):
                 self.emit("  " + r, "dim")
             if o.data.get("backup"):
                 self.emit("  备份：%s" % o.data["backup"], "dim")
+        self.run_async(job)
+
+    def act_edl_flash(self) -> None:
+        """9008 直写 boot 分区。
+
+        ONYX 的 abl 把 fastboot 的 flash handler 裁掉了（`remote: 'unknown
+        command'`），所以上面那个按钮在这几台机器上必然失败。9008 是 SoC
+        自己的下载模式，走 Firehose，跟 fastboot 无关 —— 裁 fastboot 裁不掉它。
+
+        前提是 programmer 与 SoC 匹配：Leaf5 是 LITO，Tab 三台是 BENGAL，
+        lito 那份在 Tab 上握手就不过。这里不猜机型，只把真实失败原因打出来。
+        """
+        boot_dir = self.cfg.base_dir / "boot"
+        path = filedialog.askopenfilename(
+            title="选择要写入的 boot 镜像（Magisk 打过补丁的）",
+            initialdir=str(boot_dir if boot_dir.is_dir() else self.cfg.base_dir),
+            filetypes=[("镜像", "*.img"), ("全部", "*.*")])
+        if not path:
+            return
+        if not messagebox.askyesno(
+                "确认用 9008 写 boot",
+                "将写入：\n%s\n\n"
+                "流程：备份原分区 → 写入 → 读回比对 sha256（不符自动回滚）\n"
+                "期间设备会黑屏并重启进 9008 下载模式，完成后自动回系统。\n"
+                "全程约 3-6 分钟（96 MB 分区要把备份、写入、读回各走一遍）。\n\n"
+                "继续？" % Path(path).name):
+            return
+
+        def job():
+            from ..ops.edl import EdlOps
+            ops = EdlOps(self.adb, self._bridge())
+            self.emit("== EDL 刷 boot ==", "head")
+            self.emit("  分区按当前槽位自动判定", "dim")
+            o = ops.flash(path)
+            self.emit(("✓ " if o.ok else "✗ ") + o.detail,
+                      "ok" if o.ok else "err")
+            for r in o.reasons:
+                self.emit("  " + r, "dim")
+            for k, label in (("backup", "备份"), ("readback", "读回")):
+                if o.data.get(k):
+                    self.emit("  %s：%s" % (label, o.data[k]), "dim")
         self.run_async(job)
 
     def act_adapt(self) -> None:

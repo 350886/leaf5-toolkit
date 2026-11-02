@@ -17,3 +17,6 @@ assets/magisk/*.apk
 assets/payload/*
 !assets/payload/device_root.sh
 !assets/payload/.gitkeep
+# EDL 那条腿的二进制：firehose programmer 与 Zadig，都是 MB 级外部件
+assets/*.bin
+assets/zadig*.exe
