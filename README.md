@@ -444,13 +444,69 @@ kernel 段 60,735,504 字节）走同一条流程 —— 自动切段、解出�
 签名用本机证书库里 Subject 为 `CN=SWT` 的证书，按 Subject 精确匹配。
 换名字：`set L5TK_SIGN_CN=CN=你要的名字`。
 
+## 四机型实测（2026-11-02）
+
+四份原厂固件（`.upx` 解密 → `payload.bin` → 裸 ARM64 `Image`）各走一遍完整适配链，
+每个数字都是本机跑出来的：
+
+| 型号 | 固件 | 内核 commit / 构建号 | Image | 解出符号 | 62 宏命中 | 与出厂模板差异 | 4 个手工宏 | V2 编出 `preload.so` |
+|---|---|---|---:|---:|---:|---:|---|---:|
+| Leaf5 | 4.2.3-rel_0928 | `g77c132eccfab-dirty` #38 | 60,735,504 | 117,009 | 55 | 10 | 自动 4/4 | 2,495,432 |
+| Tab8 | 4.2-rel_0603 | `ge2582afab8ec-dirty` #11 | 72,483,328 | 110,455 | 55 | 55 | 自动 4/4 | 2,495,352 |
+| Tab8C | 4.2-rel_0605 | `ge2582afab8ec-dirty` #12 | 72,483,328 | 110,455 | 55 | 55 | 自动 4/4 | 2,495,352 |
+| Tab10 | 4.2-rel_0630 | `g45e1596201e0-dirty` #41 | 72,483,328 | 110,457 | 55 | 55 | 自动 4/4 | 2,495,432 |
+
+- 「与出厂模板差异」= 62 个 `*_OFF` 宏里跟 `targets/onyx-leaf5/target.h` 值不同的个数。
+  Leaf5 差 10 个、三台 Tab 差 55 个 —— **换构建号必须整套重算**，抄模板必崩。
+- 「自动 4/4」= `ainsn.py` 解机器码定出的 `TASK_REAL_CRED_OFF` / `TASK_CRED_OFF` /
+  `PRCTL_FRAME_TOTAL` / `WAITER_LOCAL_OFF`，四份 ROM 得值全同
+  `0x7D8 / 0x7E0 / 0x200 / 0x50` —— 同一棵 ONYX 4.19 树，结构体布局一字节没动，
+  只有符号地址在漂。
+- **型号之间只差地址，不差布局**：符号名字集合四份之间只在重名符号上有个位差异，
+  62 个宏用到的符号全在。Tab8 与 Tab8C 是同一 commit（只差增量号），
+  一份载荷大概率同时吃这两台；Tab10 是另一个 commit，不能互顶。
+- 交叉验证：Leaf5 那份 Image 用 `kallsyms-finder` 独立解一遍，符号集合 0 多 0 少，
+  地址 98.1% 相同（剩 1.9% 是重名符号取到不同那份）。
+- 两版 `target.h` 的 163 个宏逐条比对，四份 ROM 全部 **0 处不一致**。
+
+### root 成不成功
+
+| 设备 | 是否 root | 依据 | 怎么测的 |
+|---|---|---|---|
+| Leaf5（`e913138`） | **是** | `id` → `uid=0(root)`、`context=u:r:magisk:s0`；`magisk -v` → `31.1:MAGISK:R`；`su` 在 `/product/bin/su` 与 `/debug_ramdisk/su` | 只读命令 |
+| Tab8 | 未测 | 没有真机 | — |
+| Tab8C | 未测 | 没有真机 | — |
+| Tab10 | 未测 | 没有真机 | — |
+
+Leaf5 现场（只读采集）：`selinux=Permissive`、`verity=enforcing`、`slot=_b`、
+`uptime=24439s`（`boot_completed=1`）。
+
+本工具的判定（都不写设备）：
+
+| 命令 | 结果 |
+|---|---|
+| `l5tk root status` | 认出 `Magisk 31.1:MAGISK:R`，`flash.locked=0` 已解锁 |
+| `l5tk --dry-run root auto` | 第 0 步短路：**已有 root**，不继续 |
+| `l5tk --dry-run root exploit` | 短路：**系统已有 su，不必再跑内核载荷** |
+
+**边界**：Leaf5 的 `uid=0` 是既有状态，本轮没重跑 `root auto` / `root exploit`（跑一次就是写设备）。
+三台 Tab 判「可以试」的依据只有**载荷编得出来 + 内核前提同构**（4.19.157 + SLUB/PAN/
+`HARDENED_USERCOPY` 同一配置面），不等于在真机上拿得到 `uid=0` —— 所以标「未测」。
+拿到机器后的顺序，前两步都不写设备：
+
+```bash
+adb shell getprop ro.debuggable        # 1 三台 Tab 是 userdebug，=1 就 adb root，不用 exploit
+l5tk probe                             # 2 只读：补准 ro.product.device
+l5tk root auto --force-rerun           # 3 临时 root，重启即恢复
+```
+
 ## 测试
 
 ```bash
 python -m pytest
 ```
 
-161 项。adb 与 fastboot 都是注入的假 runner，跑的是真解析逻辑，不起进程、不连设备。
+171 项。adb 与 fastboot 都是注入的假 runner，跑的是真解析逻辑，不起进程、不连设备。
 
 ## V1 → V2 未迁清单
 
