@@ -61,7 +61,7 @@ class FakeAdb:
 
     def __init__(self, props=None, serial="ABCD1234EFGH", state="device",
                  packages=None, top="", su=False, accounts="",
-                 su_forms=None, su_timed_out=False,
+                 su_forms=None, su_timed_out=False, magisk="",
                  partitions=("boot_a", "boot_b", "vbmeta_a", "vbmeta_b")):
         self.props = dict(props or LEAF5_PROPS)
         self.serial = serial
@@ -72,6 +72,7 @@ class FakeAdb:
         # su=True 时默认只认 Magisk 的 `su -c`；传 su_forms 可模拟只认老式 `su 0`
         self.su_forms = su_forms if su_forms is not None else {("su", "-c")}
         self.su_timed_out = su_timed_out
+        self.magisk = magisk
         self.accounts = accounts
         self.partitions = tuple(partitions)
         self.calls: list[tuple[str, ...]] = []
@@ -140,6 +141,10 @@ class FakeAdb:
             return ok(argv, "Starting: Intent\nStatus: ok\n" if self.top else "Starting: Intent\n")
         if rest[:2] == ["cat", "/proc/version"]:
             return ok(argv, "Linux version 5.10.66 (build@host) #38 SMP PREEMPT\n")
+        if rest and rest[0].split("/")[-1] == "magisk" and rest[1:2] == ["-v"]:
+            if self.magisk:
+                return ok(argv, self.magisk + "\n")
+            return ok(argv, "inaccessible or not found\n", rc=127)
         if rest and rest[0] == "su":
             # 只比前两段：`su -c id` 和 `su -c "dd if=..."` 是同一形式
             form = tuple(rest[:2])

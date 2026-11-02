@@ -176,7 +176,9 @@ class App(tk.Tk):
     def act_probe(self) -> None:
         def job():
             self.emit("读取设备信息…", "dim")
-            rep = Prober(self.adb, self._bridge()).run(deep=False)
+            # 必须 deep=True：deep=False 不填 root/账号，界面上就永久显示「无」，
+            # 和旁边「检查 Root」的结论直接打架。adb root 会重启 adbd，这里不自动做。
+            rep = Prober(self.adb, self._bridge()).run(deep=True, allow_adb_root=False)
             self.report = rep
             p = rep.detection.profile
             self.after(0, lambda: self.profile_var.set(

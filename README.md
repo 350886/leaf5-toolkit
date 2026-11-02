@@ -135,8 +135,15 @@ python -m l5tk root flash magisk_patched.img
 
 ## root 判定
 
-`python -m l5tk root status` 与 `probe` 用的是同一套判定（`l5tk/ops/probe.py:detect_root`），
-不会再出现「检查设备说没有、检查 Root 说有」这种互相矛盾的结果。
+`python -m l5tk root status` 与界面上的「读取设备信息」「检查 Root」用的是同一套判定
+（`l5tk/ops/probe.py:detect_root`），不会再出现「检查设备说没有、检查 Root 说有」这种互相矛盾的结果。
+
+「读取设备信息」曾经用 `deep=False`，根本不查 root 和账号，界面上那两行是默认值「无」，
+跟旁边「检查 Root」的结论直接打架。现在它走 `deep=True`，但 `allow_adb_root=False` ——
+`adb root` 会让 adbd 重启、当前连接断掉，不该藏在「看一眼」里。
+
+顺手加了一条契约：`deep=False` 时报告写的是 **「未探测」**，不是「无」。
+没查过的事不能给结论。
 
 两条实测踩到的坑，都改成显式处理了：
 

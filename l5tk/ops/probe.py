@@ -79,6 +79,7 @@ class Report:
     store_version: str = ""
     google_accounts: list[str] = field(default_factory=list)
     foreground: str = ""
+    deep: bool = False           # 是否真的探过 root/账号；没探过就不能显示「无」
     warnings: list[str] = field(default_factory=list)
 
     # --- 派生结论 ---
@@ -120,7 +121,7 @@ class Report:
             "Google Play : %s%s" % (
                 self.store_version or "未安装",
                 "（前台运行中）" if self.foreground == STORE else ""),
-            "Google 账号 : %s" % (", ".join(self.google_accounts) or "无"),
+            "Google 账号 : %s" % self._accounts_line(),
         ]
         if p and p.notes and not p.verified:
             lines.append("提示        : 档案未在真机验证 —— %s" % p.notes[0])
@@ -129,12 +130,20 @@ class Report:
         return "\n".join(lines)
 
     def _root_line(self) -> str:
+        # 没探过就说没探过。「无」是一个结论，deep=False 时我们并没有这个结论
+        if not self.deep:
+            return "未探测（本次只读了属性与包）"
         if self.rooted:
             return "有（%s）" % (self.magisk or "su")
         if self.adb_root_ok:
             return "可 adb root"
         # 「无」加一句为什么，否则用户没法判断是要刷机还是要授权
         return "无（%s）" % self.su_detail if self.su_detail else "无"
+
+    def _accounts_line(self) -> str:
+        if self.google_accounts:
+            return ", ".join(self.google_accounts)
+        return "无" if self.deep else "未探测"
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -159,9 +168,16 @@ class Prober:
         self.adb = adb
         self.log = log
 
-    def run(self, deep: bool = True) -> Report:
+    def run(self, deep: bool = True, allow_adb_root: bool = True) -> Report:
+        """采集设备画像。
+
+        deep=False 只取属性与包（快），但不填 root / 账号 —— 那两行会显示成「无」，
+        是假信息。UI 点「读取设备信息」曾经用 deep=False，于是「Root: 无」
+        与旁边「检查 Root: 有」自相矛盾。现在 UI 用 deep=True 但 allow_adb_root=False：
+        只读探测照做，`adb root`（会重启 adbd、断掉连接）不自动执行。
+        """
         dev = self.adb.pick()
-        rep = Report(serial=dev.serial)
+        rep = Report(serial=dev.serial, deep=deep)
         register_secret(dev.serial)
 
         self.log.info("读取系统属性")
@@ -186,7 +202,8 @@ class Prober:
 
         if deep:
             self.log.info("检查 root 能力")
-            rep.su, rep.su_detail, rep.magisk, rep.adb_root_ok = detect_root(self.adb)
+            rep.su, rep.su_detail, rep.magisk, rep.adb_root_ok = detect_root(
+                self.adb, allow_adb_root=allow_adb_root)
 
             self.log.info("检查 Google 账号")
             rep.google_accounts = self._accounts()

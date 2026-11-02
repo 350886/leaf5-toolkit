@@ -163,16 +163,26 @@ class RootOps:
 
     # ---------------- 状态 ----------------
     def status(self) -> Outcome:
-        su, su_detail, magisk, adb_root = detect_root(self.adb)
+        # 只读检查，不自动 `adb root` —— 那条命令会让 adbd 重启、当前连接断掉，
+        # 放在「看一眼状态」里代价太大。要试另有 `root adb`。
+        su, su_detail, magisk, _adb_root = detect_root(self.adb, allow_adb_root=False)
         locked = self.adb.getprop("ro.boot.flash.locked")
-        state = "rooted" if (su or magisk) else ("adb_root" if adb_root else "none")
+        debuggable = self.adb.getprop("ro.debuggable").strip() == "1"
+        build_type = self.adb.getprop("ro.build.type").strip()
+        can_adb_root = debuggable and build_type != "user"
+        state = "rooted" if (su or magisk) else "none"
+        if state == "rooted":
+            detail = "已有 root（%s）" % (magisk or "su")
+        elif su_detail:
+            detail = "当前没有 root 权限：%s" % su_detail
+        elif can_adb_root:
+            detail = "当前没有 root 权限；这台是 userdebug，可以试 adb root"
+        else:
+            detail = "当前没有 root 权限；user 版只能 Magisk 补 boot 再刷"
         return Outcome(
-            ok=(state != "none"), stage=state,
-            detail={"rooted": "已有 root（%s）" % (magisk or "su"),
-                    "adb_root": "userdebug 可直接 adb root",
-                    "none": "当前没有 root 权限%s"
-                            % ("：%s" % su_detail if su_detail else "")}[state],
-            data={"su": su, "magisk": magisk, "adb_root": adb_root,
+            ok=(state != "none"), stage=state, detail=detail,
+            data={"su": su, "magisk": magisk, "adb_root": False,
+                  "can_try_adb_root": can_adb_root,
                   "su_detail": su_detail,
                   "flash_locked": locked,
                   "unlocked": locked.strip() == "0"},

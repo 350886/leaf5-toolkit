@@ -158,3 +158,41 @@ def test_rooted_line_shows_magisk(cfg):
     rep = _deep(cfg, FakeAdb(su=True))
     assert rep.rooted
     assert rep._root_line().startswith("有（")
+
+
+def test_shallow_says_unknown_not_none(cfg):
+    """deep=False 时没探过 root/账号，不能报「无」——那会与「检查 Root」打架。"""
+    rep = _report(cfg, FakeAdb(su=True))          # deep=False
+    assert not rep.deep
+    text = rep.summary()
+    assert "Root        : 未探测" in text
+    assert "Google 账号 : 未探测" in text
+    assert "Root        : 无" not in text
+
+
+def test_deep_fills_both(cfg):
+    """deep=True 才允许下结论。"""
+    rep = _deep(cfg, FakeAdb(su=True, magisk="31.1:MAGISK:R", accounts=DUMPSYS_ACCOUNT))
+    assert rep.deep
+    text = rep.summary()
+    assert "Root        : 有（Magisk" in text
+    assert "theluck.blue@gmail.com" in text
+
+
+def test_shallow_says_unknown_not_none(cfg):
+    """deep=False 时没探过 root/账号，不能报「无」——那会与「检查 Root」打架。"""
+    rep = _report(cfg, FakeAdb(su=True))          # deep=False
+    assert not rep.deep
+    text = rep.summary()
+    assert "Root        : 未探测" in text
+    assert "Google 账号 : 未探测" in text
+    assert "Root        : 无" not in text
+
+
+def test_deep_fills_both(cfg):
+    """deep=True 才允许下结论。"""
+    rep = _deep(cfg, FakeAdb(su=True, magisk="31.1:MAGISK:R", accounts=DUMPSYS_ACCOUNT))
+    assert rep.deep
+    text = rep.summary()
+    assert "Root        : 有（Magisk" in text
+    assert "theluck.blue@gmail.com" in text
