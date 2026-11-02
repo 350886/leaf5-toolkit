@@ -62,6 +62,11 @@ class App(tk.Tk):
         self._q: queue.Queue[tuple[str, str]] = queue.Queue()
         self._busy = False
 
+        # 一键 root 里 magisk dd 是固定的一步，所以模块默认跟着装 ——
+        # 等于 V1「勾了 Magisk 就自动勾上模块」的结果。Leaf5 上不装的话
+        # Magisk App 会卡在启动画面（AMS 对 null ProcessRecord 解引用）。
+        self.var_module = tk.BooleanVar(value=True)
+
         self._build()
         self.after(120, self._pump)
         self.after(300, self.act_probe)
@@ -105,6 +110,17 @@ class App(tk.Tk):
             b = ttk.Button(left, text=text, command=cmd)
             b.pack(fill="x", pady=4)
             self.btns.append(b)
+            if text == "一键 Root":
+                # 紧跟着一键按钮摆，不塞到列表末尾 —— 它是这条链的选项，
+                # 不是独立动作。默认勾上，理由见 __init__ 里那段注释。
+                self.chk_module = tk.Checkbutton(
+                    left, text="顺带装 AMS 修复模块",
+                    variable=self.var_module,
+                    bg=BG, fg=MUTED, selectcolor=PANEL,
+                    activebackground=BG, activeforeground=FG,
+                    font=("Segoe UI", 9), anchor="w",
+                    highlightthickness=0, bd=0, padx=0)
+                self.chk_module.pack(fill="x", padx=(10, 0), pady=(0, 4))
 
         ttk.Separator(left, orient="horizontal").pack(fill="x", pady=10)
         tk.Label(left, text="机型档案", bg=BG, fg=MUTED,
@@ -155,6 +171,9 @@ class App(tk.Tk):
         state = "disabled" if busy else "normal"
         for b in self.btns:
             b.configure(state=state)
+        # 勾选框不在 btns 里，单独管：跑到一半改它，读取时机就说不清了
+        if getattr(self, "chk_module", None) is not None:
+            self.chk_module.configure(state=state)
         self.foot.configure(text="执行中…" if busy else "就绪")
 
     def run_async(self, fn) -> None:
@@ -251,7 +270,7 @@ class App(tk.Tk):
             from ..ops.autoroot import AutoRoot
             self.emit("== 一键 root ==", "head")
             r = AutoRoot(self.adb, self.fb, self._bridge()).run(
-                with_module=False, reboot=True, image=None,
+                with_module=self.var_module.get(), reboot=True, image=None,
                 allow_fastboot=False)
             self.emit(("✓ " if r.ok else "✗ ") + r.detail,
                       "ok" if r.ok else "err")

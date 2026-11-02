@@ -159,3 +159,79 @@ def test_kernel_changed_blocks_writeback():
         assert_kernel_unchanged(_Img(20 << 20), _Img(21 << 20))
     assert "禁止写入" in e.value.message
     assert "分区未改动" in e.value.message
+
+
+# ---------------- AMS 模块：失败不能拖垮已写好的 boot ----------------
+
+def _ops_without_device():
+    """不走 __init__（那要真 adb），只拿到一个能调 _module_or_skip 的壳。"""
+    from l5tk.logx import null_logger
+    from l5tk.ops.magisk import MagiskOps
+
+    ops = MagiskOps.__new__(MagiskOps)
+    ops.log = null_logger()
+    return ops
+
+
+def test_module_patch_mismatch_is_skipped_not_fatal():
+    """补丁点字节不符时降级成「跳过」。
+
+    Tab 三台是 Android 11 framework，0x2b2fee 上不可能是 DEX_OLD。走到这一步
+    boot 已经写回并回读校验过，把整条链判失败等于告诉用户「刷机失败」——
+    实际 root 马上就会生效，只是 Magisk App 还会崩。
+    """
+    ops = _ops_without_device()
+
+    def boom():
+        raise ImageError("0x%x 处不是预期字节（读到 38 01 3f 00，期望 %s）"
+                         % (DEX_OFF, DEX_OLD.hex(" ")),
+                         hint="这个偏移只对固件 4.2.3-rel_0928 成立")
+
+    ops._prepare_module = boom
+    msg = ops._module_or_skip()
+    assert "跳过" in msg
+    assert "0x%x" % DEX_OFF in msg
+
+
+def test_module_ok_passes_message_through():
+    ops = _ops_without_device()
+    ops._prepare_module = lambda: "AMS 修复模块已铺 boox-ams-fix"
+    assert ops._module_or_skip() == "AMS 修复模块已铺 boox-ams-fix"
+
+
+# ---------------- AMS 模块：失败不能拖垮已写好的 boot ----------------
+
+def _ops_without_device():
+    """不走 __init__（那要真 adb），只拿到一个能调 _module_or_skip 的壳。"""
+    from l5tk.logx import null_logger
+    from l5tk.ops.magisk import MagiskOps
+
+    ops = MagiskOps.__new__(MagiskOps)
+    ops.log = null_logger()
+    return ops
+
+
+def test_module_patch_mismatch_is_skipped_not_fatal():
+    """补丁点字节不符时降级成「跳过」。
+
+    Tab 三台是 Android 11 framework，0x2b2fee 上不可能是 DEX_OLD。走到这一步
+    boot 已经写回并回读校验过，把整条链判失败等于告诉用户「刷机失败」——
+    实际 root 马上就会生效，只是 Magisk App 还会崩。
+    """
+    ops = _ops_without_device()
+
+    def boom():
+        raise ImageError("0x%x 处不是预期字节（读到 38 01 3f 00，期望 %s）"
+                         % (DEX_OFF, DEX_OLD.hex(" ")),
+                         hint="这个偏移只对固件 4.2.3-rel_0928 成立")
+
+    ops._prepare_module = boom
+    msg = ops._module_or_skip()
+    assert "跳过" in msg
+    assert "0x%x" % DEX_OFF in msg
+
+
+def test_module_ok_passes_message_through():
+    ops = _ops_without_device()
+    ops._prepare_module = lambda: "AMS 修复模块已铺 boox-ams-fix"
+    assert ops._module_or_skip() == "AMS 修复模块已铺 boox-ams-fix"

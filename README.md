@@ -268,6 +268,16 @@ python -m l5tk root magisk --full --no-reboot  # 写回后不重启，自己选�
 python -m l5tk --dry-run root magisk --full    # 只列计划，设备一个字节不动
 ```
 
+AMS 修复模块在界面上是「一键 Root」下面那个勾选框，**默认勾上** —— 和 V1
+「勾了 Magisk 就自动勾上模块」的结果一致。不装的话 Magisk App 会卡在启动画面
+（ONYX 把 `addPackageDependency` 的 `proc == null` 分支改成了自己的追踪代码，
+一进去就 `iget-object v0, v1, ProcessRecord;->info`，`v1` 为 null）。root 本身正常，
+只是 App 打不开。
+
+补丁点 `0x2b2fee` 只对 Leaf5 的 `4.2.3-rel_0928` 成立。Tab 三台是 Android 11
+framework，同一偏移的字节必然不符 —— 那时模块会自动降级成「跳过并说明原因」，
+**不会把已经写回并校验过的 boot 判成失败**。
+
 **为什么不走 `fastboot flash`**：ONYX 的 abl 把 flash 子命令裁了，
 `fastboot flash boot_b` 实测返回 `remote: 'unknown command'`。
 所以写回只能 `dd` —— 而有 dd 权限的前提是已经 root，这条路线必须排在拿到 root 之后。
@@ -506,7 +516,7 @@ l5tk root auto --force-rerun           # 3 临时 root，重启即恢复
 python -m pytest
 ```
 
-171 项。adb 与 fastboot 都是注入的假 runner，跑的是真解析逻辑，不起进程、不连设备。
+173 项。adb 与 fastboot 都是注入的假 runner，跑的是真解析逻辑，不起进程、不连设备。
 
 ## V1 → V2 未迁清单
 
@@ -517,7 +527,7 @@ python -m pytest
 | 检测 | `--check` | ✅ `probe` / `root status` | — |
 | 商店 | `--gplay` | ✅ `gplay enable` | — |
 | 全自动 Magisk | `--magisk` | ✅ `root magisk --full` | — |
-| AMS 模块 | `--module` | ✅ `--module` | — |
+| AMS 模块 | `--module` | ✅ `--module` + 界面勾选框（默认勾） | — |
 | 一键入口 | `--auto` | ✅ `root auto` | — |
 | 指定串口 | `--serial` | ✅ | — |
 | 内核 exploit | `--root N` | ✅ `root exploit`（单轮 + 判定 + 内核闸） | — |

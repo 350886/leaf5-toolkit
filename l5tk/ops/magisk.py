@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ..core.adb import Adb
-from ..core.errors import AdbError, DeviceError, ImageError
+from ..core.errors import AdbError, DeviceError, ImageError, L5Error
 from ..core.result import Outcome
 from ..logx import Logger
 from .root import parse_boot
@@ -377,7 +377,7 @@ class MagiskOps:
         # 7) AMS 修复模块（可选，与 Magisk 同一次重启生效）
         module_msg = ""
         if with_module:
-            module_msg = self._prepare_module()
+            module_msg = self._module_or_skip()
 
         # 8) 装 App
         self.log.info("  安装 Magisk App…")
@@ -404,6 +404,21 @@ class MagiskOps:
         )
 
     # ---------------- AMS 模块 ----------------
+    def _module_or_skip(self) -> str:
+        """铺 AMS 修复模块，失败降级成一句提示。
+
+        走到这一步时 boot 已经写回并回读校验过，root 马上就会生效。
+        补丁点 `0x2b2fee` 只对 Leaf5 的 `4.2.3-rel_0928`（A13 framework）成立；
+        Tab 三台是 A11 framework，同一偏移的字节必然不符 —— 那时候正确的结果是
+        「root 成功、模块跳过」，不是「刷机失败」。把异常吞在这里，
+        让 install_full 继续往装 App、重启走。
+        """
+        try:
+            return self._prepare_module()
+        except L5Error as e:
+            self.log.warn("  AMS 模块未铺：%s" % e.message)
+            return "AMS 模块跳过（%s）" % e.message
+
     def _prepare_module(self) -> str:
         """把补丁后的 services.jar 铺成 Magisk 模块。
 
