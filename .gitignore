@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+build/
+dist/
+logs/
+work/
+boot/
+*.spec
+assets/apk/*.apk
+!assets/apk/.gitkeep
+assets/bin/*
+!assets/bin/.gitkeep
