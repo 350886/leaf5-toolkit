@@ -30,18 +30,9 @@ from ..ops.gplay import GPlay
 from ..ops.probe import Prober
 from ..ops.root import RootOps
 
-# 深色配浅色字，和 V1 一致，避免用户两台工具切来切去不适应
-BG = "#1e1f22"
-PANEL = "#2b2d30"
-FG = "#d7d9dd"
-MUTED = "#8b8f96"
-# 比 MUTED 再暗一档，专门给「用在什么情况」那类条件说明用：
-# 两行说明如果同样亮度，会糊成一整段，用户分不出哪句是使用条件。
-DIM = "#7a7f86"
-ACCENT = "#4c9aff"
-OK = "#4ec9a0"
-WARN = "#e2b341"
-ERR = "#ef6b6b"
+# 配色搬到 theme.py：使用说明窗口、适配向导要用同一套，散在这里会让它们
+# 反向 import app（连带把整条 ops 依赖链拖进窗口模块）。
+from .theme import ACCENT, BG, DIM, ERR, FG, FONT_CN, FONT_UI, MUTED, OK, PANEL, WARN  # noqa: E402
 
 W = 900
 # 每个按钮多了「用在」那一行，左栏比原来高约 8×14px；窗口跟着长高，
@@ -84,6 +75,11 @@ class App(tk.Tk):
         self.var_module = tk.BooleanVar(value=True)
 
         self._build()
+        self._build_menu()
+        # 快捷键挂在根窗口上：说明窗口是 Toplevel，它自己另有一套绑定
+        self.bind("<F1>", lambda _e: self.act_help())
+        self.bind("<Control-l>", lambda _e: self.act_clear_log())
+        self.bind("<Control-q>", lambda _e: self.quit())
         self.after(120, self._pump)
         self.after(300, self.act_probe)
 
@@ -104,6 +100,48 @@ class App(tk.Tk):
         else:
             step = -2 if getattr(e, "delta", 0) > 0 else 2
         self._cv.yview_scroll(step, "units")
+
+    # ---------------- 菜单 ----------------
+    def _menu(self, parent: tk.Menu) -> tk.Menu:
+        """深色菜单。tk 默认菜单在 Windows 上是浅色的，跟窗口拼在一起很突兀，
+        所以每个子菜单都要显式给底色 —— 这个没法继承。"""
+        return tk.Menu(parent, tearoff=0, bg=PANEL, fg=FG, bd=0,
+                       activebackground=ACCENT, activeforeground="#ffffff",
+                       activeborderwidth=0, font=(FONT_CN, 9))
+
+    def _build_menu(self) -> None:
+        bar = tk.Menu(self, tearoff=0, bg=PANEL, fg=FG, bd=0,
+                      activebackground=ACCENT, activeforeground="#ffffff",
+                      activeborderwidth=0, font=(FONT_CN, 9))
+
+        m_file = self._menu(bar)
+        m_file.add_command(label="打开日志目录", accelerator="",
+                           command=self.act_open_logs)
+        m_file.add_command(label="打开工作目录（备份在这）",
+                           command=self.act_open_work)
+        m_file.add_separator()
+        m_file.add_command(label="导出使用说明…", command=self.act_export_help)
+        m_file.add_separator()
+        m_file.add_command(label="退出", accelerator="Ctrl+Q", command=self.quit)
+        bar.add_cascade(label="文件", menu=m_file)
+
+        m_tool = self._menu(bar)
+        m_tool.add_command(label="重新检测设备", command=self.act_probe)
+        m_tool.add_command(label="清空日志窗口", accelerator="Ctrl+L",
+                           command=self.act_clear_log)
+        bar.add_cascade(label="工具", menu=m_tool)
+
+        m_help = self._menu(bar)
+        m_help.add_command(label="使用说明", accelerator="F1",
+                           command=self.act_help)
+        m_help.add_command(label="导出为 txt…", command=self.act_export_help)
+        m_help.add_separator()
+        m_help.add_command(label="项目主页", command=self.act_homepage)
+        m_help.add_command(label="关于", command=self.act_about)
+        bar.add_cascade(label="帮助", menu=m_help)
+
+        self.configure(menu=bar)
+        self.menubar = bar
 
     # ---------------- 布局 ----------------
     def _build(self) -> None:
@@ -520,6 +558,43 @@ class App(tk.Tk):
             webbrowser.open(self.cfg.log_dir.as_uri())
         except Exception as e:
             self.emit("打不开目录：%s（%s）" % (self.cfg.log_dir, e), "err")
+
+    def act_open_work(self) -> None:
+        """备份、抽出来的 boot、适配工作区都在这里 —— 排障时要翻的是它。"""
+        d = self.cfg.work_dir
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+            webbrowser.open(d.as_uri())
+        except Exception as e:
+            self.emit("打不开目录：%s（%s）" % (d, e), "err")
+
+    def act_clear_log(self) -> None:
+        """只清界面，不动盘上的日志 —— 日志是事后唯一证据，不能因为看着乱就删。"""
+        self.text.configure(state="normal")
+        self.text.delete("1.0", "end")
+        self.text.configure(state="disabled")
+        self.foot.configure(text="日志窗口已清空（盘上的日志不受影响）")
+
+    def act_help(self) -> None:
+        from .helpwin import open_help
+        open_help(self, self.cfg)
+
+    def act_export_help(self) -> None:
+        from .helpwin import export_plain
+        try:
+            path = export_plain(self)
+        except OSError as e:
+            messagebox.showerror("导出失败", str(e), parent=self)
+            return
+        if path:
+            self.emit("使用说明已导出：%s" % path, "dim")
+
+    def act_homepage(self) -> None:
+        webbrowser.open("https://github.com/350886/leaf5-toolkit")
+
+    def act_about(self) -> None:
+        from .helpwin import open_about
+        open_about(self, self.cfg)
 
     def _bridge(self, echo_ok: bool = False) -> Logger:
         """把 Logger 的输出接到界面：界面拿一行，落盘仍走 self.log。"""
