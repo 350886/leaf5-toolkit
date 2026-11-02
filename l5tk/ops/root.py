@@ -1,12 +1,15 @@
-"""Root：状态判定 + 用 fastboot 刷已补丁的 boot 镜像。
+"""Root：状态判定 + 刷已补丁的 boot 镜像。
 
-刻意不做的事：V2 不自己打 Magisk 补丁，也不自己走 9008 写 flash。
-  * Magisk 补丁在设备上用官方 App 打，产物 `magisk_patched-*.img`，可控可查。
-  * 9008 需要与 SoC 匹配的 firehose programmer，Leaf5 是 LITO(SM6350)，
-    Tab 系列是 BENGAL(SM6115)，V1 里那两份 lito programmer 在 Tab 上直接不认。
-    把这条写进引导文案，比给一个会失败的分支有用。
+两条写 boot 的路线，按前提选：
 
-所以 V2 的 root 路径是：adb root（userdebug）→ 不然 Magisk 补 boot → fastboot 刷。
+  * `root magisk --full`（ops/magisk.py）：已经 root 时用。设备内跑 boot_patch.sh
+    生成 new-boot.img，再 dd 写回 —— ONYX 的 abl 把 `fastboot flash` 裁了，
+    `fastboot flash boot_b` 实测返回 `remote: 'unknown command'`。
+  * `root flash`（本模块）：手上已经有一个打好补丁的镜像、且设备能进 bootloader 时用。
+
+9008 这条不做：需要与 SoC 匹配的 firehose programmer，Leaf5 是 LITO(SM6350)，
+Tab 系列是 BENGAL(SM6115)，V1 里那两份 lito programmer 在 Tab 上直接不认。
+
 每一步都留证据，刷之前必须能备份，备份不了就不刷。
 """
 
@@ -297,26 +300,18 @@ class RootOps:
     def magisk_apk(self) -> Path | None:
         """内置 Magisk APK 的位置。
 
-        查找顺序与 _find_bin 一致：EXE 同级 -> 打包内。
-        同级优先是为了让用户换版本（比如 Magisk 32）时不用重新打包，
-        丢一个 apk 进 assets\\magisk\\ 就生效。
+        实现放在 ops/magisk.py：那边是真正消费它的地方。
+        这里延迟导入是躲 root <-> magisk 的循环（magisk 要用 parse_boot）。
         """
-        cfg = self.adb.cfg
-        for base in (cfg.base_dir, cfg.bundle_dir):
-            d = Path(base) / "assets" / "magisk"
-            if not d.is_dir():
-                continue
-            apks = sorted(p for p in d.glob("*.apk") if p.is_file())
-            if apks:
-                return apks[0]
-        return None
+        from .magisk import find_apk
+        return find_apk(self.adb.cfg)
 
     def install_magisk(self, reinstall: bool = True) -> Outcome:
-        """装内置的 Magisk App，并把「下一步」写成能照做的两行。
+        """只装内置的 Magisk App，并把「下一步」写成能照做的两行。
 
-        为什么只装 App 不代打补丁：补丁要在设备上由 Magisk 自己解当前 boot、
-        判断机型、压 ramdisk，全在 App 的 native 侧；在 PC 侧重做一遍等于
-        重写 Magisk。装 App 是能自动化的那一段，剩下的交给它。
+        默认只装 App：用户可能只是想拿 App 里的模块管理，不想动 boot 分区。
+        要全自动（设备内打补丁 + dd 写回）走 `root magisk --full`，
+        实现见 ops/magisk.py，那条路会真写 boot 分区。
         """
         apk = self.magisk_apk()
         if apk is None:

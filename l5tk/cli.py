@@ -67,6 +67,12 @@ def build_parser() -> argparse.ArgumentParser:
     root.add_argument("--no-backup", action="store_true", help="跳过刷前备份")
     root.add_argument("--no-reinstall", action="store_true",
                       help="magisk：已装时不覆盖")
+    root.add_argument("--full", action="store_true",
+                      help="magisk：全自动（备份 → 设备内打补丁 → dd 写回 → 回读校验）")
+    root.add_argument("--module", action="store_true",
+                      help="magisk --full：顺带铺 AMS 修复模块（ONYX 的 Magisk App 崩溃）")
+    root.add_argument("--no-reboot", action="store_true",
+                      help="magisk --full：写回后不重启，由你自己选时机")
     root.add_argument("--force", action="store_true",
                       help="档案未验证/已上锁时仍然执行")
 
@@ -235,6 +241,25 @@ def cmd_root(args, log) -> int:
         return RC_OK if o.ok else RC_FAIL
 
     if args.action == "magisk":
+        # 不带 --full 只装 App；带 --full 走 V1 那条「设备内打补丁 + dd 写回」。
+        # 两条路差的是「要不要动 boot 分区」，所以拆成显式开关而不是默认行为。
+        if args.full:
+            from .ops.magisk import MagiskOps
+            try:
+                o = MagiskOps(adb, log).install_full(
+                    part=args.part, with_module=args.module,
+                    reboot=not args.no_reboot)
+            except L5Error as e:
+                print(e.render())
+                return RC_FAIL
+            print(("成功：" if o.ok else "失败：") + o.detail)
+            for r in o.reasons:
+                print("  " + r)
+            for k in ("stock", "patched", "module"):
+                if o.data.get(k):
+                    print("  %-8s %s" % (k + ":", o.data[k]))
+            return RC_OK if o.ok else RC_FAIL
+
         o = ops.install_magisk(reinstall=not args.no_reinstall)
         print(("成功：" if o.ok else "失败：") + o.detail)
         for r in o.reasons:

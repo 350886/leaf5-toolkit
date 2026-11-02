@@ -239,8 +239,28 @@ cp /path/to/Magisk-v31.1.apk assets/magisk/
 `l5tk doctor` 的第二列会标 `[内嵌]` 还是 `[PATH]`：
 内嵌 adb 和系统 adb 同时跑会抢 5037 端口，连不上设备时先看这一行。
 
-`root magisk` 只装 App，不代打补丁 —— 补丁要在设备上由 Magisk 自己解当前 boot、
-判机型、压 ramdisk，PC 侧重做一遍等于重写 Magisk。装完会打印接下来那两步。
+`root magisk` 只装 App；`root magisk --full` 走全自动，会真写 boot 分区：
+
+```bash
+python -m l5tk root magisk --full              # 备份→打补丁→写回→回读→重启
+python -m l5tk root magisk --full --module     # 顺带铺 ONYX 的 AMS 修复模块
+python -m l5tk root magisk --full --no-reboot  # 写回后不重启，自己选时机
+python -m l5tk --dry-run root magisk --full    # 只列计划，设备一个字节不动
+```
+
+**为什么不走 `fastboot flash`**：ONYX 的 abl 把 flash 子命令裁了，
+`fastboot flash boot_b` 实测返回 `remote: 'unknown command'`。
+所以写回只能 `dd` —— 而有 dd 权限的前提是已经 root，这条路线必须排在拿到 root 之后。
+
+四个「立刻停、分区一个字节没动」的点：
+
+1. boot 备份没拉回 PC 并校验 md5 一致 → 不 patch
+2. 备份不是合法 boot 镜像（无 `ANDROID!`）→ 不 patch
+3. 打出来的 new-boot.img 的 **kernel 段长度变了** → 不写回
+4. 写回后回读 md5 与镜像不符 → 不重启，把备份路径直接打出来
+
+第 3 条最容易被忽略：md5 只证明「写进去的和生成的一样」，
+证明不了「生成的是对的」。kernel 段变了说明分区拿错或补丁工具版本不对，写进去必砖。
 
 签名用本机证书库里 Subject 为 `CN=SWT` 的证书，按 Subject 精确匹配。
 换名字：`set L5TK_SIGN_CN=CN=你要的名字`。
@@ -251,7 +271,7 @@ cp /path/to/Magisk-v31.1.apk assets/magisk/
 python -m pytest
 ```
 
-96 项。adb 与 fastboot 都是注入的假 runner，跑的是真解析逻辑，不起进程、不连设备。
+107 项。adb 与 fastboot 都是注入的假 runner，跑的是真解析逻辑，不起进程、不连设备。
 
 ## 未验证项
 
