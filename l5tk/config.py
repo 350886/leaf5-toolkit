@@ -75,6 +75,11 @@ class Config:
     bundle_dir: Path = field(default_factory=_bundle_dir)
     work_dir: Path = field(default_factory=lambda: Path(_env("WORK") or (_exe_dir() / "work")))
     log_dir: Path = field(default_factory=lambda: Path(_env("LOG_DIR") or (_exe_dir() / "logs")))
+    # 适配工作区：源码副本、target 仓库、NDK、最近用过的镜像。
+    # 放 %LOCALAPPDATA% 而不是 EXE 旁边 —— NDK 裁剪后 1.6GB，不能跟着工具走。
+    adapt_root: Path = field(default_factory=lambda: Path(
+        _env("ADAPT") or (Path(os.environ.get(
+            "LOCALAPPDATA") or Path.home()) / "Leaf5Toolkit" / "adapt")))
 
     # --- 超时（秒）。adb 在 Windows 上偶尔卡 usb 枚举，短超时比挂死好 ---
     timeout_short: int = field(default_factory=lambda: _env_int("TIMEOUT_SHORT", 15))
@@ -90,7 +95,7 @@ class Config:
     dry_run: bool = field(default_factory=lambda: _env_bool("DRY_RUN", False))
 
     def ensure_dirs(self) -> None:
-        for d in (self.work_dir, self.log_dir):
+        for d in (self.work_dir, self.log_dir, self.adapt_root):
             d.mkdir(parents=True, exist_ok=True)
 
     def describe(self) -> dict[str, str]:

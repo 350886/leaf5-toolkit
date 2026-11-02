@@ -203,6 +203,9 @@ def cfg(tmp_path):
     c.fastboot = "fastboot"
     c.work_dir = tmp_path / "work"
     c.log_dir = tmp_path / "logs"
+    # 适配仓库也隔离：否则用例会读到本机 %LOCALAPPDATA% 里真实的 target，
+    # 「内核闸」这类用例就会随开发机状态时好时坏
+    c.adapt_root = tmp_path / "adapt"
     c.ensure_dirs()
     return c
 

@@ -98,6 +98,7 @@ class App(tk.Tk):
             ("一键 Root", self.act_autoroot),
             ("装 Magisk App", self.act_magisk),
             ("④ 刷入 boot 镜像", self.act_flash),
+            ("内核适配（换固件）", self.act_adapt),
             ("打开日志目录", self.act_open_logs),
         ]
         for text, cmd in actions:
@@ -287,6 +288,13 @@ class App(tk.Tk):
             if o.data.get("backup"):
                 self.emit("  备份：%s" % o.data["backup"], "dim")
         self.run_async(job)
+
+    def act_adapt(self) -> None:
+        """内核适配向导。单独一个窗口 —— 它要下 NDK、跑几分钟编译，
+        不能占住主界面的按钮。带着当前 adb 进去，省得用户再选设备。"""
+        from .adapt_win import open_window
+        open_window(self, self.cfg, self.adb, self.log,
+                    serial=self.cfg.serial or "")
 
     def act_open_logs(self) -> None:
         try:

@@ -74,9 +74,12 @@ def _has_real_file(d: Path, pattern: str = "*") -> bool:
 
     只看 any(d.iterdir()) 会被 .gitkeep 骗到 —— 空目录也当成有货，
     于是 --add-data 一个什么都没有的目录，打出来的 EXE 里 adb 还是缺的。
+
+    必须递归：assets/exploit_src 下面只有 exploit/ 一层目录，文件在更深处，
+    只 glob("*") 会判成「空」，整个适配向导的源码就进不了包（实测踩过）。
     """
     return d.is_dir() and any(
-        p.is_file() and p.name != ".gitkeep" for p in d.glob(pattern))
+        p.is_file() and p.name != ".gitkeep" for p in d.rglob(pattern))
 
 
 def _data_args(gp: bool, work: Path) -> list[str]:
@@ -86,7 +89,9 @@ def _data_args(gp: bool, work: Path) -> list[str]:
     # 而内嵌 adb 和系统 adb 版本不一致时（server 端口抢占）排查成本很高。
     # payload 是内核 exploit 的载荷（preload.so + device_root.sh）。
     # 它绑死一个内核构建，所以按目录整套打 —— 少一个文件就只剩报错。
-    for sub in ("bin", "magisk", "payload"):
+    # exploit_src 是内核适配向导的原料：换固件后要拿它现场重编 preload.so，
+    # 缺了就只能让用户自己装 git 拉仓库。
+    for sub in ("bin", "magisk", "payload", "exploit_src"):
         d = ROOT / "assets" / sub
         if _has_real_file(d):
             args += ["--add-data", "%s;assets/%s" % (d, sub)]

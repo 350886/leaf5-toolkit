@@ -13,7 +13,8 @@ def test_parser_has_all_commands():
     actions = [a for a in p._actions if a.dest == "cmd"]
     assert actions
     assert set(actions[0].choices) == {
-        "profiles", "devices", "doctor", "probe", "root", "gplay", "verify"}
+        "profiles", "devices", "doctor", "probe", "root", "gplay", "verify",
+        "adapt"}
 
 
 def test_profiles(capsys):

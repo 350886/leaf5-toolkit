@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 
 from . import __version__
@@ -97,6 +98,60 @@ def build_parser() -> argparse.ArgumentParser:
 
     vf = sub.add_parser("verify", help="验收：root / 商店 / GMS 逐项过")
     vf.add_argument("--json", action="store_true")
+
+    # ---------------- 内核适配 ----------------
+    ad = sub.add_parser(
+        "adapt", help="内核适配向导：换固件后重新生成 preload.so")
+    asub = ad.add_subparsers(dest="act", required=True)
+
+    a1 = asub.add_parser("scan", help="在本机找现成的内核镜像")
+    a1.add_argument("--disk", action="store_true", help="全盘扫（默认只扫常见目录）")
+    a1.add_argument("--seconds", type=float, default=0, help="扫描预算（秒）")
+    a1.add_argument("--depth", type=int, default=0, help="目录深度")
+
+    a2 = asub.add_parser("banner", help="读镜像里的 linux_banner，跟设备对一下")
+    a2.add_argument("path", help="boot.img / 裸 Image / vmlinux.elf 都行")
+    a2.add_argument("--device", default="",
+                    help="设备不在时手工贴 /proc/version 的内容")
+
+    a3 = asub.add_parser("kallsyms", help="从设备导出 /proc/kallsyms（需要 su）")
+    a3.add_argument("-o", "--out", default="")
+
+    a4 = asub.add_parser("gen", help="镜像/kallsyms → targets/<id>/target.h")
+    a4.add_argument("src", help="boot.img / Image / vmlinux.elf / kallsyms.txt")
+    a4.add_argument("--id", default="", help="target id（默认按内核串自动起名）")
+    a4.add_argument("--fingerprint", default="")
+    a4.add_argument("--kernel", default="")
+    a4.add_argument("--keep", action="store_true",
+                    help="保留模板原值，只报告差异（同版本重编用）")
+    a4.add_argument("--no-inherit", action="store_true",
+                    help="同源也强制留 4 个手工占位符")
+    a4.add_argument("--inherit", action="store_true",
+                    help="明知与模板有差异也沿用模板的 4 个手工宏"
+                         "（你确认这台设备的结构体布局与模板一致时才用）")
+
+    a5 = asub.add_parser("fill", help="填 target.h 里那 4 个手工宏")
+    a5.add_argument("tid")
+    a5.add_argument("--set", action="append", default=[], metavar="MACRO=VALUE",
+                    help="可重复；VALUE 收 0x 或十进制")
+
+    a6 = asub.add_parser("build", help="编译 preload.so（首次会下 NDK）")
+    a6.add_argument("tid")
+    a6.add_argument("-o", "--out", default="")
+    a6.add_argument("--cc", default="", help="clang 路径（默认自动找/下载 NDK）")
+
+    asub.add_parser("list", help="列出已适配的 target")
+
+    a7 = asub.add_parser("install", help="把编好的 so 收进 target 仓库")
+    a7.add_argument("so")
+    a7.add_argument("--id", required=True)
+    a7.add_argument("--fingerprint", default="")
+    a7.add_argument("--kernel", default="")
+
+    a8 = asub.add_parser("use", help="指定 root 时用哪份 preload.so")
+    a8.add_argument("tid")
+
+    asub.add_parser("status", help="当前设备命中哪个 target")
 
     return p
 
@@ -201,8 +256,22 @@ def cmd_doctor(args, log) -> int:
         print("\n设备：%s" % e.render())
         ok_all = False
 
+    # 适配过的 target：换固件的机器靠它跑内核路径，没适配就只有出厂那一版能用
+    try:
+        from .ops.adapt import Adapter
+        ts = Adapter(cfg, log, adb, serial=args.serial or "").list_targets()
+        withso = [t for t in ts if t.has_so()]
+        print("%-10s %-6s %s" % ("适配", "OK" if withso else "无",
+                                 "%d 个 target（%d 个已编译）%s"
+                                 % (len(ts), len(withso),
+                                    "：" + ", ".join(t.id for t in withso[:3])
+                                    if withso else " —— 换过固件就跑 adapt")))
+    except L5Error:
+        pass
+
     print("日志目录：%s" % cfg.log_dir)
     print("工作目录：%s" % cfg.work_dir)
+    print("适配目录：%s" % cfg.adapt_root)
     return RC_OK if ok_all else RC_USAGE
 
 
@@ -411,10 +480,226 @@ def cmd_verify(args, log) -> int:
     return RC_OK if all(o for _, o, _ in checks) else RC_FAIL
 
 
+def cmd_adapt(args, log) -> int:
+    """内核适配。动作之间互相独立，中间产物都落在 cfg.adapt_root 里。"""
+    from .core import kimage
+    from .ops.adapt import Adapter, MANUAL_MACROS, fill_manuals, placeholders
+
+    cfg, adb, _fb = _ctx(args, log)
+    a = Adapter(cfg, log, adb, serial=args.serial or "")
+    act = args.act
+
+    if act == "scan":
+        kw = {}
+        if args.seconds:
+            kw["budget"] = args.seconds
+        if args.depth:
+            kw["max_depth"] = args.depth
+        if args.disk:
+            usable, others = kimage.scan_disks(log=log.info, **kw)
+        else:
+            usable, others = kimage.scan_kernels(
+                roots=kimage.scan_roots([str(a.root)]), log=log.info, **kw)
+        if usable:
+            print("%-8s %-10s %s" % ("大小", "类型", "路径"))
+            for i in usable:
+                print("%-8s %-10s %s"
+                      % (kimage.human_size(i["size"]), i["kind"], i["path"]))
+                if i.get("note"):
+                    print("         %s" % i["note"])
+        else:
+            print("没找到能直接用的内核镜像。")
+        if others:
+            print("\n找到了但用不上（strip 过 / 解不开）：")
+            for i in others[:10]:
+                print("  %-8s %-6s %s\n         %s"
+                      % (kimage.human_size(i["size"]), i["kind"],
+                         i["path"], i["note"]))
+        if usable:
+            print("\n下一步：l5tk adapt gen \"<路径>\"")
+        else:
+            print("\n两条路：把设备 boot 分区的镜像拖进来（boot.img 也能现场反解），")
+            print("        或设备已 root 时 l5tk adapt kallsyms")
+        return RC_OK if usable else RC_FAIL
+
+    if act == "banner":
+        res = kimage.banner_check(args.path, adb=cfg.adb,
+                                  serial=args.serial or "", log=log.info)
+        if not res:
+            print("[X] 这个文件里找不到 linux_banner —— 不是完整内核镜像")
+            return RC_FAIL
+        if args.device:
+            v, why, adv = kimage.banner_match(res["image"], args.device)
+            res.update(device=args.device.strip(), verdict=v, why=why, advice=adv)
+            print("\n结论：%s\n      %s" % (why, adv))
+        elif res["verdict"] == "unknown":
+            print("\n" + res["advice"])
+        print("\n镜像 banner：%s" % res["image"])
+        if res.get("device"):
+            print("设备 version：%s" % res["device"])
+        if res["verdict"] == "different":
+            print("\n[!] 这份镜像不是设备上正在跑的内核，别用它生成 target.h")
+            return RC_FAIL
+        return RC_OK
+
+    if act == "kallsyms":
+        out = args.out or str(a.src_root / ("kallsyms-%s.txt"
+                                            % time.strftime("%Y%m%d-%H%M%S")))
+        try:
+            path, st = kimage.grab_kallsyms(out, adb=cfg.adb,
+                                            serial=args.serial or "", log=log.info)
+        except L5Error as e:
+            print(e.render())
+            return RC_FAIL
+        print("\n%s" % path)
+        print("  行数 %d   符号 %d   %s   _text 0x%016X"
+              % (st["lines"], st["syms"], kimage.human_size(st["size"]), st["text"]))
+        print("下一步：l5tk adapt gen \"%s\"" % path)
+        return RC_OK
+
+    if act == "gen":
+        if not Path(args.src).is_file():
+            print("文件不存在：%s" % args.src)
+            return RC_USAGE
+        try:
+            r = a.gen(args.src, fingerprint=args.fingerprint,
+                      kernel=args.kernel, tid=args.id or None,
+                      inherit_manual=not args.no_inherit,
+                      force_inherit=args.inherit, keep=args.keep,
+                      log=log.info)
+        except L5Error as e:
+            print(e.render())
+            return RC_FAIL
+        print("\ntarget      : %s" % r.tid)
+        print("目录        : %s" % r.tdir)
+        print("符号偏移    : %d 个（%d 个宏无同名符号）" % (r.offsets, len(r.missing)))
+        print("与模板差异  : %d 个宏" % len(r.diffs))
+        print("手工宏      : %s"
+              % {"inherited": "沿用模板值（同源构建）",
+                 "forced": "沿用模板值（--inherit 强制）",
+                 "template": "待填"}.get(r.manual, r.manual))
+        if r.banner:
+            print("镜像 banner : %s" % r.banner)
+        if r.unfilled:
+            print("\n还差 %d 个手工宏（符号表里没有，必须反汇编/panic 定标）："
+                  % len(r.unfilled))
+            for m, hint in MANUAL_MACROS:
+                if m in r.unfilled:
+                    print("  %-28s %s" % (m, hint))
+            print("\n填法：l5tk adapt fill %s --set TASK_CRED_OFF=0x7e0 ..." % r.tid)
+        else:
+            print("\n下一步：l5tk adapt build %s" % r.tid)
+        return RC_OK
+
+    if act == "fill":
+        vals = {}
+        for item in args.set:
+            if "=" not in item:
+                print("格式是 MACRO=VALUE：%s" % item)
+                return RC_USAGE
+            k, v = item.split("=", 1)
+            try:
+                vals[k.strip()] = int(v.strip(), 0)
+            except ValueError:
+                print("值不是整数：%s" % item)
+                return RC_USAGE
+        tdir = a.targets_root / args.tid
+        if not (tdir / "target.h").is_file():
+            print("没有这个 target：%s" % args.tid)
+            return RC_USAGE
+        left = fill_manuals(tdir, vals, log=log.info)
+        if left:
+            print("还差：%s" % ", ".join(left))
+            return RC_FAIL
+        print("填完了。下一步：l5tk adapt build %s" % args.tid)
+        return RC_OK
+
+    if act == "build":
+        tdir = a.targets_root / args.tid
+        if not (tdir / "target.h").is_file():
+            print("没有这个 target：%s" % args.tid)
+            return RC_USAGE
+        left = placeholders(tdir)
+        if left:
+            print("target.h 还差 %d 个手工宏：%s" % (len(left), ", ".join(left)))
+            return RC_FAIL
+        try:
+            so, md5, size = a.compile(tdir, out_so=args.out or None,
+                                      cc=args.cc or None, log=log.info)
+        except L5Error as e:
+            print(e.render())
+            return RC_FAIL
+        t = a.install(args.tid, so, a.device_meta())
+        print("\n%s  %d 字节  md5=%s" % (so, size, md5))
+        print("已收进 %s" % t.dir)
+        print("下一步：l5tk adapt use %s（或直接 root exploit，按设备自动匹配）" % t.id)
+        return RC_OK
+
+    if act == "list":
+        ts = a.list_targets()
+        if not ts:
+            print("还没有适配过的 target。")
+            print("  换过固件的机器：l5tk adapt gen <boot.img 或 kallsyms.txt>")
+            return RC_OK
+        act_id = a.active()
+        print("%-34s %-8s %-34s %s"
+              % ("id", "so", "kernel", "来源"))
+        for t in ts:
+            mark = "*" if t.id == act_id else " "
+            print("%s%-33s %-8s %-34s %s"
+                  % (mark, t.id, "有" if t.has_so() else "缺",
+                     (t.kernel or "?")[:34],
+                     "V1" if t.legacy else "V2"))
+        print("\n* = adapt use 指定的；没标 * 时按设备指纹/内核串自动挑")
+        return RC_OK
+
+    if act == "install":
+        if not Path(args.so).is_file():
+            print("文件不存在：%s" % args.so)
+            return RC_USAGE
+        meta = {"fingerprint": args.fingerprint, "kernel": args.kernel,
+                "note": "adapt install 收进来的"}
+        t = a.install(args.id, args.so, meta)
+        print("已装进 %s（md5=%s）" % (t.dir, t.meta.get("so_md5")))
+        return RC_OK
+
+    if act == "use":
+        try:
+            t = a.use(args.tid)
+        except L5Error as e:
+            print(e.render())
+            return RC_FAIL
+        print("root exploit 会用 %s（%s）" % (t.id, t.kernel or "内核串未记录"))
+        return RC_OK
+
+    if act == "status":
+        dev = a.device_meta()
+        if not dev:
+            print("读不到设备信息（没插设备或 adb 不通）")
+            return RC_USAGE
+        print("设备指纹：%s" % (dev.get("fingerprint") or "?"))
+        print("内核    ：%s" % (dev.get("kernel") or "?"))
+        t = a.pick(fingerprint=dev.get("fingerprint", ""),
+                   kernel=dev.get("kernel", ""))
+        if t:
+            print("命中    ：%s（%s）" % (t.id, "V1 遗产" if t.legacy else "V2"))
+            print("          %s" % t.so)
+        else:
+            print("命中    ：无 —— 这台设备的内核还没有适配过")
+            print("          先 adapt gen / adapt kallsyms，再 build")
+        act_id = a.active()
+        if act_id:
+            print("手动指定：%s（优先级高于自动匹配）" % act_id)
+        return RC_OK
+
+    print("未知动作：%s" % act)
+    return RC_USAGE
+
+
 HANDLERS = {
     "profiles": cmd_profiles, "devices": cmd_devices, "doctor": cmd_doctor,
     "probe": cmd_probe, "root": cmd_root, "gplay": cmd_gplay,
-    "verify": cmd_verify,
+    "verify": cmd_verify, "adapt": cmd_adapt,
 }
 
 

@@ -48,6 +48,10 @@ python -m l5tk root check boot.img      # 只校验镜像，不碰设备
 python -m l5tk root magisk              # 装内置的 Magisk App
 python -m l5tk root flash boot.img      # 备份 → 刷入 → 失败自动回滚
 python -m l5tk verify                   # 逐项验收
+python -m l5tk adapt scan               # 找本机现成的内核镜像
+python -m l5tk adapt gen boot.img       # 换固件：生成 target.h
+python -m l5tk adapt build <id>         # 编译 preload.so（首次下 NDK）
+python -m l5tk adapt use <id>           # 指定 root 时用这份
 ```
 
 退出码：`0` 成功 / `1` 动作失败 / `2` 用法或环境问题 / `3` dry-run 被拒。
@@ -75,7 +79,12 @@ l5tk/
 │   ├── adb.py         subprocess 调 adb，超时/编码/引号
 │   ├── fastboot.py    列设备、读变量、刷分区、等回 adb
 │   ├── result.py      ExecResult / Step / Outcome
-│   └── errors.py      异常类型，message 是人话
+│   ├── errors.py      异常类型，message 是人话
+│   ├── kimage.py      boot 切段/解压/banner/找镜像/导 kallsyms
+│   ├── elfsyms.py     ELF / kallsyms / Image 三种符号来源统一入口
+│   ├── imageksym.py   裸 ARM64 Image 里现场反解 kallsyms
+│   ├── ndk.py         找/下/裁 NDK，给出 clang 路径
+│   └── fp.py          无 root 的内核指纹采集与匹配
 ├── device/            只回答「这是什么机器」
 │   ├── profiles.py    档案表：Leaf5 / Tab8C / Tab8 / Tab10 / Tab 家族兜底
 │   ├── detect.py      打分识别，歧义即拒绝
@@ -83,8 +92,14 @@ l5tk/
 ├── ops/               组合 core + device
 │   ├── probe.py       一次取全，矛盾标 warning
 │   ├── gplay.py       装/拉起/判定，APK 按目录优先级选
-│   └── root.py        boot header 校验、备份、刷入、回滚
-└── ui/app.py          tkinter，后台线程 + 队列，不卡界面
+│   ├── root.py        boot header 校验、备份、刷入、回滚
+│   ├── exploit.py     内核载荷：闸 / 部署 / 起跑 / 判定
+│   ├── magisk.py      设备内打补丁 + dd 写回 + AMS 模块
+│   ├── autoroot.py    五条 root 路径按代价排序
+│   └── adapt.py       内核适配：target.h、三段编译、target 仓库
+└── ui/
+    ├── app.py         主窗口，后台线程 + 队列，不卡界面
+    └── adapt_win.py   内核适配向导（独立 Toplevel）
 ```
 
 依赖方向是单向的：`core` 与 `device` 不 import `ops`，`ops` 不 import `ui`。
@@ -227,6 +242,7 @@ C:\Users\<你>\AppData\Local\Programs\Python\Python312\python.exe   带 Tk 8.6 +
 | `fastboot.exe` | `assets/bin/` | 2.2 MB | 刷 boot、读 bootloader 状态 |
 | `Magisk-v31.1.apk` | `assets/magisk/` | 10.2 MB | `root magisk` 直接装到设备 |
 | `preload.so` + `device_root.sh` | `assets/payload/` | 2.4 MB | `root exploit` 的内核载荷 |
+| exploit 源码（`src/` + `targets/onyx-leaf5/target.h`） | `assets/exploit_src/` | 740 KB | 适配向导现场重编 preload.so 的原料 |
 
 查找顺序：**EXE 同级 `assets\` > 包内解出的 `assets\` > `PATH`**。
 同级优先是有意的：换 adb 二进制或换 Magisk 版本时，丢文件进同级目录就生效，不用重新打包。
@@ -315,6 +331,84 @@ python -m l5tk --dry-run root exploit        # 只过闸，不推载荷
 `root auto` 不会假装成功：哪条不通就打哪条的原因，最后一段写清下一步。
 例如没 `su` 时会直接说「dd 读写 boot 分区的前提不成立」并提示 `--image`。
 
+### 内核适配（换固件）
+
+上面那道闸挡住了「换了固件的机器」。适配就是把 62 个偏移按**设备上正在跑的内核**
+重算一遍，编出新的 `preload.so`：
+
+```bash
+python -m l5tk adapt scan                    # 本机有没有现成 vmlinux / boot.img
+python -m l5tk adapt scan --disk             # 全盘找（先扫数据盘，180 秒上限）
+python -m l5tk adapt banner boot.img         # 读 linux_banner，跟设备 /proc/version 对一下
+python -m l5tk adapt kallsyms                # 设备已 root：直接导 /proc/kallsyms
+python -m l5tk adapt gen boot.img            # → targets/<id>/target.h
+python -m l5tk adapt fill <id> --set TASK_CRED_OFF=0x7e0 ...
+python -m l5tk adapt build <id>              # 编译（首次自动下 NDK，约 700MB）
+python -m l5tk adapt use <id>                # 指定用它；不给就按设备自动匹配
+python -m l5tk adapt list                    # 已适配清单（* 是 use 指定的）
+python -m l5tk adapt status                  # 当前设备命中哪个 target
+```
+
+符号来源四种都吃，**调用方不用区分**：`vmlinux.elf`、裸 ARM64 `Image`、
+`boot.img`（切 kernel 段再解 gzip/xz/lzma/lz4/zstd）、`/proc/kallsyms` 文本。
+裸 Image 的符号表是**现场反解**的（kallsyms 的 token 表就编在 `.rodata` 里），
+所以设备没 root、手上又只有 boot 分区镜像时这条路照样走得通。
+
+能自动的：符号偏移、`target.h` 骨架、编译、设备↔target 匹配。
+不能自动的 4 个宏（结构体布局与栈帧大小，符号表里没有）：
+
+| 宏 | 怎么取 |
+|---|---|
+| `WAITER_LOCAL_OFF` | `rt_mutex_waiter` 里 task 字段偏移，出厂 0x50 / 主线 0x40 |
+| `TASK_CRED_OFF` | `commit_creds` 里 `ldr x8,[x19,#0x7e0]` 的立即数 |
+| `PRCTL_FRAME_TOTAL` | `__arm64_sys_prctl` 开头的 `stp/sub sp` 指令 |
+| `PRCTL_WAITER_WORD_DEFAULT` | `PRCTL_POISON=1` 跑一次，从 `x21` 反推 |
+
+**同源构建直接继承**：镜像提出来每个宏都等于模板原值，就说明是同一份内核，
+这 4 个值自动沿用模板，`gen` 完可以直接 `build`。（`--no-inherit` 强制留占位符。）
+
+运行时匹配的优先级：符号序列 sha256 → `ro.build.fingerprint` → `uname -r`。
+命中就用适配出来的 so，没命中退回内置载荷并照旧过内核闸。
+V1 的 `%LOCALAPPDATA%\Leaf5RootTool\targets` 也读（`adapt list` 里标 `V1`），
+之前用 V1 适配过的机器不用重做。
+
+界面上是「内核适配（换固件）」那个按钮：来源自动找、候选可切、差异表显示
+哪些宏跟模板不一样、四个宏填完点编译，最后一步装进工具。
+
+#### 四个型号 ROM 实测（2026-11-02）
+
+素材是 `firmware/_img/*.Image`：从 `.upx` 固件包里解出来的裸 ARM64 kernel，
+不接设备、不需要 root，正好能把「解析 → 生成 → 编译」整条链跑穿。
+
+| 镜像 | 内核 | 本文解码器 | 独立工具 `kallsyms-finder` | 62 宏提取 | 与模板差异 |
+|---|---|---|---|---|---|
+| Leaf5 4.2.3-rel_0928 | `4.19.157-perf-g77c132eccfab-dirty` #38 | 117,009 符号 | 117,009（同集合） | 55 个 | 10 |
+| Tab8 4.2-rel_0603 | `4.19.157-perf-ge2582afab8ec-dirty` #11 | 110,455 | — | 55 个 | 55 |
+| Tab8C 4.2-rel_0605 | 同上 commit #12 | 110,455 | — | 55 个 | 55 |
+| Tab10 4.2-rel_0630 | `4.19.157-perf-g45e1596201e0-dirty` #41 | 110,457 | 110,457（同集合） | 55 个 | 55 |
+
+两组交叉验证的结论：
+
+- 符号**名字集合完全一致**（0 个多、0 个少），结构定位（token 表 / markers /
+  names / offsets）没有错位；逐条比 114,776 / 108,320 条地址相同，剩下 1.9%
+  全是**重名符号**（`.compoundliteral.N`、`status_change_work` 这类同一名字
+  出现 2~6 次），本文取最小地址、对照工具取另一条 —— 62 个宏里没有重名，不影响。
+- 7 个宏本来就没有同名符号：`bss_zero_lock` / `bss_scratch` /
+  `bss_lowzero_scratch` 和 4 个 `slide_*`，都是 exploit 自己挑的 .bss 槽位，
+  不是内核符号，属预期。
+
+**一条实测发现**：出厂 `target.h` 里有 10 个宏与这台机器的 ROM 内核不一致，
+其中 9 个源码一次都没引用（`RB_*` / `PLIST_*` / `KIMAGE_*` 这些备用路径），
+但 `SECURITY_HOOK_HEADS_OFF` 被 `common.h` 的 `SECURITY_CAPABLE_HEAD` 用到：
+模板写 `0x03137470`，本机固件实际是 `0x03137AB0`（差 0x640）。
+设备固件同样是 `4.2.3-rel_0928`，说明模板留的是更早一次构建的值。
+主路径不受影响（实测能拿 uid=0），而走一遍适配会把它按镜像重算成真值。
+
+编译链路：用 Leaf5 这份 ROM 生成 target 后编出 2,495,432 字节的 `preload.so`；
+与同源 target 的产物比反汇编，**只差一条 `mov x22, #-0x8b50` / `#-0x8510`**
+（就是上面那个 0x640），其余指令逐条相同 —— 既证明其余 9 个差异宏确实没进代码，
+也证明适配后的偏移真的落到了代码里。
+
 签名用本机证书库里 Subject 为 `CN=SWT` 的证书，按 Subject 精确匹配。
 换名字：`set L5TK_SIGN_CN=CN=你要的名字`。
 
@@ -324,7 +418,7 @@ python -m l5tk --dry-run root exploit        # 只过闸，不推载荷
 python -m pytest
 ```
 
-137 项。adb 与 fastboot 都是注入的假 runner，跑的是真解析逻辑，不起进程、不连设备。
+142 项。adb 与 fastboot 都是注入的假 runner，跑的是真解析逻辑，不起进程、不连设备。
 
 ## V1 → V2 未迁清单
 
@@ -339,18 +433,18 @@ python -m pytest
 | 一键入口 | `--auto` | ✅ `root auto` | — |
 | 指定串口 | `--serial` | ✅ | — |
 | 内核 exploit | `--root N` | ✅ `root exploit`（单轮 + 判定 + 内核闸） | — |
-| 内核适配向导 | `stage_adapt` | ❌ 未迁 | 换固件要重编 `preload.so`，得接 ndk + 符号比对 |
-| 要求 CAP_SYS_ADMIN | `--sysadmin` | ❌ 未迁 | 判定数据在 exploit 日志的 `bnd=` 里，取出来即可 |
-| 强制重跑 | `--force-rerun` | ❌ 未迁 | 与「已 root 就停」的幂等冲突，要一个显式开关 |
-| adb 端口 | `--port` | ❌ 未迁 | 与内核 exploit 无关，可单独做 |
+| 内核适配向导 | `stage_adapt` | ✅ `adapt gen/build/use` + 界面窗口 | — |
+| 要求 CAP_SYS_ADMIN | `--sysadmin` | ✅ `root exploit --sysadmin`（夹具验证） | 真机完整分支未跑 |
+| 强制重跑 | `--force-rerun` | ✅ `root exploit --force-rerun`（夹具验证） | 真机完整分支未跑 |
+| adb 端口 | `--port` | ✅ `--port 5053` | — |
 | USB 诊断 | `usbtrace` | ❌ 未迁 | 需 pyusb |
 | 驱动安装 | `zadig.exe` | ❌ 未迁 | 5.3 MB 内嵌 exe |
 | EDL 只读 | `--edl env/slot/gpt/dump` | ❌ 未迁 | 整套 `edlclient` 11,730 行 |
 | EDL 写 flash | `--edl w` | ❌ 不做 | 缺 BENGAL 的 firehose programmer |
 
-内核 exploit 已迁完主干（推载荷 → 跑一轮 → 判定 uid=0 → 失败给日志路径），
-剩下三样都不影响「一台匹配内核的 Leaf5 从裸机到 root」这条主路径；
-「内核适配向导」是给**换固件**用的，那件事没有真机跑不出来。
+内核 exploit 与内核适配都已迁完。剩下三样（usbtrace / zadig / EDL）不影响
+「一台 Leaf5 从裸机到 root」这条主路径。适配向导本身在真机上只验证到
+「同源镜像 → 生成 → 编译」，换内核那条分支要等一台换了固件的机器。
 
 ## 未验证项
 
