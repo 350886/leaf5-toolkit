@@ -77,6 +77,9 @@ class FakeAdb:
         self.partitions = tuple(partitions)
         self.calls: list[tuple[str, ...]] = []
         self.fail_on: set[str] = set()
+        # adb root 之后 adbd 以 root 重启，`shell id` 就该是 uid=0 ——
+        # 不模拟这一点，try_adb_root 的「root 成功但 id 不是 0」永远是失败分支
+        self.rooted = False
 
     def __call__(self, argv, timeout):
         argv = tuple(str(a) for a in argv)
@@ -118,6 +121,8 @@ class FakeAdb:
             Path(args[2]).write_bytes(b"\x00" * (3 * 1024 * 1024))
             return ok(argv, "[100%] /data/local/tmp/boot_backup.img\n")
         if head == "root":
+            if not self.rooted:
+                self.rooted = True
             return ok(argv, "restarting adbd as root\n")
         return ok(argv, "")
 
@@ -159,6 +164,10 @@ class FakeAdb:
             if self.su and form in self.su_forms:
                 return ok(argv, "uid=0(root) gid=0(root) groups=0(root) context=u:r:magisk:s0\n")
             return ok(argv, "su: permission denied\n", rc=1)
+        if rest[0] == "id":
+            if self.rooted:
+                return ok(argv, "uid=0(root) gid=0(root) groups=0(root)\n")
+            return ok(argv, "uid=2000(shell) gid=2000(shell)\n")
         if rest[:2] == ["stat", "-c"]:
             return ok(argv, "67108864\n")
         return ok(argv, "")

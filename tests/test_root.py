@@ -97,6 +97,11 @@ class FakeFb:
         if args[:1] == ["-s"]:
             args = args[2:]
         head = args[0] if args else ""
+        if head == "devices" and not str(argv[0]).lower().endswith("fastboot.exe") \
+                and "fastboot" not in str(argv[0]).lower():
+            # wait_for_adb 会借同一个 runner 发 `adb devices`：不认出来就会
+            # 一直匹配不到 `\tdevice`，干等满 180 秒
+            return ExecResult(argv, 0, "List of devices attached\nABCD1234\tdevice\n", "", 2)
         if head == "devices":
             return ExecResult(argv, 0, "XYZ789\tfastboot\n", "", 2)
         if head == "getvar":

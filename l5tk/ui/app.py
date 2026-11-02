@@ -95,6 +95,7 @@ class App(tk.Tk):
             actions.append(("② 装 Google Play", self.act_gplay))
         actions += [
             ("③ 检查 Root", self.act_root),
+            ("一键 Root", self.act_autoroot),
             ("装 Magisk App", self.act_magisk),
             ("④ 刷入 boot 镜像", self.act_flash),
             ("打开日志目录", self.act_open_logs),
@@ -236,6 +237,27 @@ class App(tk.Tk):
             self.emit(("✓ " if o.ok else "× ") + o.detail, "ok" if o.ok else "err")
             for r in o.reasons:
                 self.emit("  " + r, "dim")
+        self.run_async(job)
+
+    def act_autoroot(self) -> None:
+        """一键：不弹确认框，但会在日志里逐步说明走到了哪一条路。
+
+        Why 不确认：这条链的第 1、2 步（adb root / dd 写 boot）本身都是
+        「已备份才写」，第 2 步内部已有四个硬闸。真正的不可逆操作
+        （fastboot flash）只在给了镜像时才走，而 UI 这里不给镜像。
+        """
+        def job():
+            from ..ops.autoroot import AutoRoot
+            self.emit("== 一键 root ==", "head")
+            r = AutoRoot(self.adb, self.fb, self._bridge()).run(
+                with_module=False, reboot=True, image=None,
+                allow_fastboot=False)
+            self.emit(("✓ " if r.ok else "✗ ") + r.detail,
+                      "ok" if r.ok else "err")
+            for s in r.steps:
+                mark = "✓" if s.ok else ("✗" if s.tried else "·")
+                self.emit("  %s %s" % (mark, s.detail.replace("\n", "\n    ")),
+                          "dim")
         self.run_async(job)
 
     def act_flash(self) -> None:

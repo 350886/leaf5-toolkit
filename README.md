@@ -15,7 +15,7 @@ ONYX BOOX 设备的一条龙运维工具。V1 是单文件 GUI，绑死 Leaf5 �
 | 机型 | `if "Leaf5" in model` 散在校验、偏移、载荷里 | `device/profiles.py` 一张表 |
 | 加一台机器 | 改 7 处，漏一处就刷错分区 | 加一条 `Profile` |
 | 出错 | 返回 `(ok, bytes, rc)` 三件套，经常忘看 rc | 抛 `L5Error` 子类，带 `hint` |
-| 测试 | 靠真机试 | 67 项，假 adb 注入，不起进程 |
+| 测试 | 靠真机试 | 124 项，假 adb 注入，不起进程 |
 
 V2 不搬 V1 的 9008 写 flash 那条路：那条路依赖与 SoC 匹配的 firehose programmer，
 Leaf5 是 LITO(SM6350)，Tab 系列是 BENGAL(SM6115)，V1 里那两份 programmer 在 Tab 上直接不认。
@@ -41,6 +41,7 @@ python -m l5tk probe                    # 设备画像
 python -m l5tk probe --json --raw       # 全量 prop，便于补档案
 python -m l5tk gplay enable             # 装商店 + 拉起 + 判定
 python -m l5tk root status              # root 状态
+python -m l5tk root auto                # 一键：已root→adb root→Magisk dd→fastboot
 python -m l5tk root adb                 # 试 adb root（userdebug）
 python -m l5tk root check boot.img      # 只校验镜像，不碰设备
 python -m l5tk root magisk              # 装内置的 Magisk App
@@ -262,6 +263,32 @@ python -m l5tk --dry-run root magisk --full    # 只列计划，设备一个字�
 第 3 条最容易被忽略：md5 只证明「写进去的和生成的一样」，
 证明不了「生成的是对的」。kernel 段变了说明分区拿错或补丁工具版本不对，写进去必砖。
 
+### 一键 root
+
+```bash
+python -m l5tk root auto                      # 已root → adb root → Magisk dd → fastboot
+python -m l5tk root auto --image p.img        # 前三步都不通时，用你给的镜像走 fastboot
+python -m l5tk root auto --no-fastboot        # 只走 adb root / dd，不进 bootloader
+python -m l5tk --dry-run root auto            # 只列会依次试哪几条，设备不动
+```
+
+四条路径按**代价从低到高**排，第一个成功就停：
+
+| 顺序 | 路径 | 前提 | 代价 |
+|---|---|---|---|
+| 0 | 已 root | 有 `su` 或 Magisk | 什么都不做（这一步就是防重复写 boot） |
+| 1 | `adb root` | `ro.debuggable=1` 且非 user 版 | adbd 重启，不碰分区 |
+| 2 | Magisk 设备内补丁 | 已有 `su` | 备份 → patch → dd 写回（见上一节四个闸） |
+| 3 | `fastboot flash` | 给了镜像、bootloader 已解锁、abl 没裁 flash | 直接写分区 |
+
+第 3 条在 Leaf5 上大概率不通 —— 它的 abl 裁了 `flash` 子命令。
+所以「裸机（没 root、user 版、abl 也裁了 flash）」这一格目前是空的：
+**这种机器要先有 root 才能装 Magisk，而装 root 又需要先有 root**，
+V1 是靠内核 exploit（`--root N`）打破这个循环的，V2 还没迁（见「未迁清单」）。
+
+`root auto` 不会假装成功：哪条不通就打哪条的原因，最后一段写清下一步。
+例如没 `su` 时会直接说「dd 读写 boot 分区的前提不成立」并提示 `--image`。
+
 签名用本机证书库里 Subject 为 `CN=SWT` 的证书，按 Subject 精确匹配。
 换名字：`set L5TK_SIGN_CN=CN=你要的名字`。
 
@@ -271,7 +298,31 @@ python -m l5tk --dry-run root magisk --full    # 只列计划，设备一个字�
 python -m pytest
 ```
 
-107 项。adb 与 fastboot 都是注入的假 runner，跑的是真解析逻辑，不起进程、不连设备。
+124 项。adb 与 fastboot 都是注入的假 runner，跑的是真解析逻辑，不起进程、不连设备。
+
+## V1 → V2 未迁清单
+
+「V1 有的 V2 必须有」逐项对，剩下的都在这里，按能不能一个人干完分组：
+
+| 能力 | V1 形态 | V2 现状 | 阻塞点 |
+|---|---|---|---|
+| 检测 | `--check` | ✅ `probe` / `root status` | — |
+| 商店 | `--gplay` | ✅ `gplay enable` | — |
+| 全自动 Magisk | `--magisk` | ✅ `root magisk --full` | — |
+| AMS 模块 | `--module` | ✅ `--module` | — |
+| 一键入口 | `--auto` | ✅ `root auto` | — |
+| 指定串口 | `--serial` | ✅ | — |
+| **内核 exploit** | `--root N` | ❌ 未迁 | `preload.so` 绑死 `4.19.157-perf-g77c132eccfab-dirty`，须整套搬 62 个偏移 + 内核适配向导 |
+| 要求 CAP_SYS_ADMIN | `--sysadmin` | ❌ 未迁 | 依赖内核 exploit |
+| 强制重跑 | `--force-rerun` | ❌ 未迁 | 依赖内核 exploit |
+| adb 端口 | `--port` | ❌ 未迁 | 与内核 exploit 无关，可单独做 |
+| USB 诊断 | `usbtrace` | ❌ 未迁 | 需 pyusb |
+| 驱动安装 | `zadig.exe` | ❌ 未迁 | 5.3 MB 内嵌 exe |
+| EDL 只读 | `--edl env/slot/gpt/dump` | ❌ 未迁 | 整套 `edlclient` 11,730 行 |
+| EDL 写 flash | `--edl w` | ❌ 不做 | 缺 BENGAL 的 firehose programmer |
+
+前四行以外，**内核 exploit 是唯一能把「裸机一键 root」补上的那块**，
+也是唯一一块必须上真机调（一轮约 210 秒、失败可能 panic）的。
 
 ## 未验证项
 

@@ -58,10 +58,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     root = sub.add_parser("root", help="root 相关")
     root.add_argument("action",
-                      choices=("status", "adb", "flash", "check", "part", "magisk"),
+                      choices=("status", "adb", "flash", "check", "part",
+                               "magisk", "auto"),
                       help="status=看状态 adb=试 adb root flash=刷 boot "
                            "check=只校验镜像 part=看会刷哪个分区（只读） "
-                           "magisk=装内置 Magisk App")
+                           "magisk=装内置 Magisk App "
+                           "auto=一键 root（按代价从低到高依次试）")
     root.add_argument("image", nargs="?", help="flash 用的 boot 镜像")
     root.add_argument("--part", help="分区名（默认按机型档案）")
     root.add_argument("--no-backup", action="store_true", help="跳过刷前备份")
@@ -72,7 +74,9 @@ def build_parser() -> argparse.ArgumentParser:
     root.add_argument("--module", action="store_true",
                       help="magisk --full：顺带铺 AMS 修复模块（ONYX 的 Magisk App 崩溃）")
     root.add_argument("--no-reboot", action="store_true",
-                      help="magisk --full：写回后不重启，由你自己选时机")
+                      help="magisk --full / auto：写回后不重启，由你自己选时机")
+    root.add_argument("--no-fastboot", action="store_true",
+                      help="auto：不试 fastboot 兜底（只走 adb root / dd）")
     root.add_argument("--force", action="store_true",
                       help="档案未验证/已上锁时仍然执行")
 
@@ -239,6 +243,25 @@ def cmd_root(args, log) -> int:
               % (o.data.get("flash_locked") or "?",
                  "是" if o.data.get("unlocked") else "否"))
         return RC_OK if o.ok else RC_FAIL
+
+    if args.action == "auto":
+        # 一键：already → adb root → Magisk dd → fastboot flash，第一个成功就停
+        from .ops.autoroot import AutoRoot
+        try:
+            r = AutoRoot(adb, fb, log).run(
+                part=args.part, with_module=args.module,
+                reboot=not args.no_reboot, image=args.image,
+                allow_fastboot=not args.no_fastboot)
+        except L5Error as e:
+            print(e.render())
+            return RC_FAIL
+        print(("成功：" if r.ok else "失败：") + r.detail)
+        for s in r.steps:
+            mark = "✓" if s.ok else ("✗" if s.tried else "·")
+            print("  %s %s" % (mark, s.detail.replace("\n", "\n    ")))
+        if r.stage == "dry_run":
+            return RC_DRYRUN
+        return RC_OK if r.ok else RC_FAIL
 
     if args.action == "magisk":
         # 不带 --full 只装 App；带 --full 走 V1 那条「设备内打补丁 + dd 写回」。
