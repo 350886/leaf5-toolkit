@@ -33,22 +33,26 @@ from ..ops.root import RootOps
 # 配色搬到 theme.py：使用说明窗口、适配向导要用同一套，散在这里会让它们
 # 反向 import app（连带把整条 ops 依赖链拖进窗口模块）。
 from .theme import ACCENT, BG, DIM, ERR, FG, FONT_CN, FONT_UI, MUTED, OK, PANEL, WARN  # noqa: E402
+from .thinbar import ThinBar  # noqa: E402
 
 W = 900
-# 每个按钮多了「用在」那一行，左栏比原来高约 8×14px；窗口跟着长高，
-# 否则日志区被挤成一条缝 —— 日志是本工具唯一的事后证据。
-# 又多了一个「EDL 刷 boot」入口（fastboot 在 ONYX 上被裁，得留替代通道），
-# 后来又加了「取原厂 boot」（刷 boot 的镜像从官方 OTA 里抽，不用自己备份）。
-H = 918 if gp_ui_enabled() else 890
+# 窗口高度不再按左栏内容撑：左栏装了 11 个按钮 + 每个两行说明，撑到 918 时
+# 在 1080 屏上贴着任务栏、在 1366×768 上直接超出屏幕。现在给一个固定上限，
+# 装不下就滚（左栏是 Canvas）—— 窗口尺寸稳定，能滚的内容不影响主界面。
+H = 760
 
 
 def _fit_height(h: int, win) -> int:
-    """窗口比屏幕高时压进屏幕内 —— 否则小笔记本上日志区整个跑到屏幕外。"""
+    """窗口比屏幕高时压进屏幕内，再留出标题栏和任务栏的余量。
+
+    以前的余量是 60，在 768 屏上只剩 708 —— 扣掉窗口边框和任务栏实际不到
+    690，底部状态栏会被任务栏盖住。留 120。
+    """
     try:
         screen = win.winfo_screenheight()
     except Exception:
         return h
-    return max(600, min(h, screen - 60))
+    return max(620, min(h, screen - 120))
 
 
 class App(tk.Tk):
@@ -56,7 +60,7 @@ class App(tk.Tk):
         super().__init__()
         self.title("l5tk %s — 多机型 Android 工具箱" % __version__)
         self.geometry("%dx%d" % (W, _fit_height(H, self)))
-        self.minsize(780, 600)
+        self.minsize(780, 620)
         self.configure(bg=BG)
 
         self.cfg = load_cfg()
@@ -87,10 +91,10 @@ class App(tk.Tk):
         """左栏滚轮。只在指针落在左栏时滚 —— 绑到全局不判位置的话，
         在日志区滚轮会同时滚左栏和日志，两个都跳得很怪。"""
         try:
-            px = self.winfo_pointerx() - self._cv.winfo_rootx()
-            py = self.winfo_pointery() - self._cv.winfo_rooty()
-            if not (0 <= px <= self._cv.winfo_width()
-                    and 0 <= py <= self._cv.winfo_height()):
+            px = self.winfo_pointerx() - self._wrap.winfo_rootx()
+            py = self.winfo_pointery() - self._wrap.winfo_rooty()
+            if not (0 <= px <= self._wrap.winfo_width()
+                    and 0 <= py <= self._wrap.winfo_height()):
                 return
         except Exception:
             return
@@ -169,11 +173,19 @@ class App(tk.Tk):
         wrap = tk.Frame(body, bg=BG, width=224)
         wrap.pack(side="left", fill="y")
         wrap.pack_propagate(False)
+        # 滚轮判定要用它：canvas + 滚动条整块都算「左栏」，否则指针落在
+        # 那 8px 滑条上滚轮就没反应。
+        self._wrap = wrap
 
-        self._cv = tk.Canvas(wrap, bg=BG, highlightthickness=0, bd=0, width=206)
-        self._sb = ttk.Scrollbar(wrap, orient="vertical",
-                                 command=self._cv.yview)
+        self._cv = tk.Canvas(wrap, bg=BG, highlightthickness=0, bd=0, width=198)
+        # 不用 ttk.Scrollbar：vista 主题下 width 被接管，画出来是 17px 的
+        # 浅灰块，深色窗口边上镶白边。自绘的 8px 细条见 thinbar.py。
+        self._sb = ThinBar(wrap, command=self._cv.yview, target=self._cv,
+                           trough="#26282c", thumb="#55595f",
+                           hover="#6c7178", offtrack="#232528", bg=BG)
         self._cv.configure(yscrollcommand=self._sb.set)
+        # pack 的 padx 只收单值，想要「只留左边」得自己包一层；
+        # 8px 的空隙在这里没意义，直接贴右边缘。
         self._sb.pack(side="right", fill="y")
         self._cv.pack(side="left", fill="both", expand=True)
 
