@@ -9,8 +9,13 @@
 
 **programmer 必须与 SoC 匹配**，这是硬门槛，不是配置问题：
 
-  Leaf5            = LITO(SM6350)    → assets/lito_op_n10_fhprg.bin   ✅ 实测通过
+  Leaf5            = LITO(SM6350)    → assets/lito_moto_fhprg.bin   ✅ 实测通过
   Tab8/Tab8C/Tab10 = BENGAL(SM6115)  → 需要 bengal 的 *_fhprg.bin，仓库里没有
+
+同平台的 `lito_op_n10_fhprg.bin` 也在包内，但它是 OnePlus N10 的**受限构建**：
+configure 只报 MaxPayload=16384，`program` 一律回 `Device verified failed` +
+`rawmode=false`，写不进去。它只能用于读。默认顺序已经把它排到后面，
+别为了「试一下」手动切过去。
 
 拿错 programmer 的表现不是「友好地报个错」，而是 Sahara 握手阶段设备不应答、
 超时退出。所以下面把「找不到 programmer」和「握手失败」分成两个 stage，
@@ -38,6 +43,7 @@ from pathlib import Path
 from ..core import drivers, edllink
 from ..core.errors import ImageError, L5Error
 from ..core.result import Outcome
+from ..core.safety import check_backup_file, require_backup
 from ..logx import Logger
 
 
@@ -171,7 +177,11 @@ class EdlOps:
     def flash(self, image: str | Path, part: str | None = None,
               backup: bool = True, verify: bool = True,
               timeout_write: int = 1800, timeout_read: int = 900) -> Outcome:
-        """把镜像写进分区。part 不给就按当前 slot 推 boot_a / boot_b。"""
+        """把镜像写进分区。part 不给就按当前 slot 推 boot_a / boot_b。
+
+        写之前必须有原分区备份，这条不可关。见 core/safety.py 顶部的原因。
+        """
+        require_backup(backup, "9008 写分区")
         img = Path(image)
         if not img.is_file():
             raise ImageError("镜像不存在：%s" % img)
@@ -229,14 +239,16 @@ class EdlOps:
                           on_line=lambda t: self.log.dbg("  " + t),
                           place=(0, e["offset"] // ss, room),
                           expect=e["length"], timeout=timeout_read)
-                got = bak.stat().st_size
-                if got != e["length"]:
+                # 备份必须真的落地、长度对得上。不过就不写 ——
+                # 拿一个短文件当退路比没有备份更危险（以为是安全网）。
+                try:
+                    check_backup_file(bak, e["length"])
+                except L5Error as ex:
                     return Outcome(
-                        False, "backup_short",
-                        "备份长度不对：%d != %d，已中止（分区未改动）"
-                        % (got, e["length"]),
-                        reasons=["USB 链路在掉包时不写 —— 没有可信备份就没有退路"])
-                self.log.ok("备份完成 %d 字节" % got)
+                        False, "backup_failed", ex.message,
+                        reasons=[ex.hint] if ex.hint else [],
+                        data={"backup": str(bak), "partition": part})
+                self.log.ok("备份完成 %d 字节" % bak.stat().st_size)
 
             self.log.info("写入 %s …" % part)
             info = sess.write(part, str(img),

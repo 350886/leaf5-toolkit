@@ -182,8 +182,11 @@ class AutoRoot:
                 # enter_seconds 有意压到 30：一键流程里让用户干等 90 秒
                 # 才说一句「进不去 fastbootd」，体验上等于卡死。30 秒进不去
                 # 的机器，基本就是不支持。
+                # backup=True：fastbootd 进去之前设备还在 Android 里，有 root
+                # 就能 dd 出原分区。没 root 时 backup_boot 会抛 DeviceError，
+                # 这一步就记为失败 —— 宁可这条路不通，也不写一个没有退路的 boot。
                 o = self.root.flash_boot(image, profile, part=part,
-                                         backup=False, force=False, via="fastbootd",
+                                         backup=True, force=False, via="fastbootd",
                                          enter_seconds=enter_seconds)
                 steps.append(Step("fastbootd", tried=True, ok=o.ok,
                                   detail=self._detail(o)))
@@ -202,19 +205,20 @@ class AutoRoot:
         if image and allow_fastboot and self._fastboot_online():
             try:
                 profile, score = self._profile()
-                # backup=False 是有意的：没 root 的机器 dd 读不了块设备，
-                # 这条路本来就没有"刷前备份"的能力。诚实的做法是把这件事
-                # 写在 detail 里，而不是先假装备份、再在 backup_boot 里炸掉。
+                # backup=True：备份在「重启进 bootloader」之前做，那时设备还在
+                # Android 里。没 root 就备份不出来 —— backup_boot 抛错，这一步
+                # 记失败。以前这里传 False 并想着「大不了在 detail 里说明」，
+                # 但刷坏的 boot 不会因为日志里提了一句就变得可救。
                 o = self.root.flash_boot(image, profile, part=part,
-                                         backup=False, force=False, via="fastboot")
+                                         backup=True, force=False, via="fastboot")
                 steps.append(Step("fastboot", tried=True, ok=o.ok,
                                   detail=self._detail(o)))
                 if o.ok:
                     return AutoResult(True, "fastboot",
-                                      self._detail(o) + "\n注意：未做刷前备份（无 root 时无法 dd）",
+                                      self._detail(o),
                                       steps, {"how": "fastboot",
                                               "profile_score": score,
-                                              "backup": "none"})
+                                              "backup": "done"})
             except L5Error as e:
                 steps.append(Step("fastboot", tried=True, ok=False, detail=e.message))
         elif image:

@@ -158,9 +158,14 @@ product 名两边会重样，不能拿来判。
 4. 分区容量装不下镜像 → 不发写命令
 
 ## 备份与回滚
+**写分区之前一定先备份，备份做不出来就不写** —— 三个通路都这样，没有开关能跳过
+（`--no-backup` 已经停用，传了会直接拒绝）。boot 分区刷坏是这台机器上唯一不能自救
+的状态，没有原分区就只能整机重刷。
+
 `dd` 通路先 `blockdev --getsize64` 比容量、把当前分区备份到 `work\\`，
-写完回读 md5；不符立刻用备份写回。`fastbootd` 通路失败也会刷回进 fastbootd
-之前备份的那份。
+写完回读 md5；不符立刻用备份写回。`fastbootd` 通路在**进 fastbootd 之前**备份
+（进去以后 adb 就断了），备份失败就中止。备份文件小于 1MB、或者长度对不上分区，
+都按「没有备份」处理。
 
 > 备份是这台机器**当前**那份 boot。root 过的机器，它已经是 Magisk 补丁过的版本，
 > 拿来当「恢复原厂」的基底不对 —— 要原厂底片请用「④ 取原厂 boot」。
@@ -182,7 +187,10 @@ product 名两边会重样，不能拿来判。
 - 6 reset 让设备离开下载模式
 
 ## programmer 必须与 SoC 匹配
-- Leaf5 = LITO(SM6350)：`lito_op_n10_fhprg.bin` 已内置。
+- Leaf5 = LITO(SM6350)：`lito_moto_fhprg.bin` 已内置（默认用这份，
+  MaxPayload 1MB，实测 96MB 写入约 4 秒）。
+- 同平台的 `lito_op_n10_fhprg.bin` 也在包内，但它是 OnePlus N10 的受限构建，
+  `program` 会被 `Device verified failed` 挡掉，只能读不能写。
 - Tab8 / Tab8C / Tab10 = BENGAL(SM6115)：仓库里没有对应的 programmer，
   这条通路在那三台上走不通。
 

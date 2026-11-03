@@ -453,8 +453,8 @@ class App(tk.Tk):
                 "写入方式：自动 —— 有 root 就直接 dd（不重启）；\n"
                 "没 root 就重启进 fastbootd 写（厂商裁了 bootloader 的 flash，\n"
                 "fastbootd 走的是另一套实现）。\n\n"
-                "有 root 时会先备份当前 boot、失败自动回滚；\n"
-                "没 root 时备份不了，失败要用原厂 boot 重刷。继续？"
+                "刷之前一定先完整备份当前 boot；备份做不出来就中止，不会写。\n"
+                "继续？"
                 % Path(path).name):
             return
 

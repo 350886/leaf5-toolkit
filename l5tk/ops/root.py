@@ -29,6 +29,7 @@ from ..core.adb import Adb
 from ..core.errors import DeviceError, ImageError, L5Error, Refused
 from ..core.fastboot import Fastboot, list_boot_images
 from ..core.result import Outcome
+from ..core.safety import check_backup_file, require_backup
 from ..device.models import Profile
 from ..logx import Logger
 from .probe import detect_root
@@ -259,7 +260,10 @@ class RootOps:
 
         auto 的顺序是 dd → fastbootd → fastboot：从「不用重启」排到
         「要重启且可能被拒」，能少动一次设备就少动一次。
+
+        写之前必须有原分区备份，这条不可关（见 core/safety.py）。
         """
+        require_backup(backup, "刷 %s" % (part or "boot"))
         img = parse_boot(image)
         self.log.info("镜像校验通过：" + img.describe())
 
@@ -432,12 +436,22 @@ class RootOps:
         """fastbootd 通路。真正的理由写在 ops/fastbootd.py 顶部。"""
         # 备份要在进 fastbootd 之前做：进去以后 adb 就断了，
         # 而且 fastbootd 只能读分区容量、读不了内容。
+        #
+        # 这里原来是 try/except 只 warn 一句就继续刷 —— 是最危险的一种写法：
+        # 日志里一行黄字，用户扫过去以为「工具提醒了但问题不大」，然后写进
+        # 一个没有退路的 boot 分区。备份做不出来就不写。
         backup_path = None
         if backup:
             try:
                 backup_path = self.backup_boot(partition)
+                check_backup_file(backup_path)
             except L5Error as e:
-                self.log.warn("刷前备份做不了：%s" % e.message)
+                return Outcome(
+                    False, "backup_failed",
+                    "刷前备份做不了，已中止（分区未改动）：%s" % e.message,
+                    reasons=[e.hint] if e.hint else
+                            ["没有原分区备份就不刷 —— boot 刷坏只能整机重刷"],
+                    data={"partition": partition})
 
         ok, how = self.fbd.enter(seconds=enter_seconds)
         if not ok:

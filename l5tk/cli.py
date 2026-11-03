@@ -82,7 +82,8 @@ def build_parser() -> argparse.ArgumentParser:
     root.add_argument("--out", help="payload：抽出来的镜像放哪（默认 work\\boot）")
     root.add_argument("--gpt", action="store_true", help="edl：只读分区表")
     root.add_argument("--loader", help="edl：firehose programmer 路径（*_fhprg.bin）")
-    root.add_argument("--no-backup", action="store_true", help="跳过刷前备份")
+    root.add_argument("--no-backup", action="store_true",
+                      help="（已停用）刷前备份无法关闭；传了会直接拒绝并退出")
     root.add_argument("--no-reinstall", action="store_true",
                       help="magisk：已装时不覆盖")
     root.add_argument("--full", action="store_true",
@@ -312,6 +313,15 @@ def cmd_probe(args, log) -> int:
 
 
 def cmd_root(args, log) -> int:
+    # --no-backup 保留参数名只为不让老脚本报「unrecognized arguments」，
+    # 但它不再能关掉备份。写分区没有退路这件事不该做成开关：
+    # 跳过的那次记得，写进脚本之后就不记得了。
+    if getattr(args, "no_backup", False):
+        print("刷前备份无法跳过：这个参数已停用，命令已取消（未动设备）。")
+        print("  boot 分区刷坏只能整机重刷，备份是唯一的退路。")
+        log.err("--no-backup 已停用，拒绝执行")
+        return RC_USAGE
+
     # payload 只解本地文件，不需要设备 —— 必须在 _ctx 之前分流，
     # 否则没插设备会被判成环境错误，而这件事本来跟设备无关。
     if args.action == "payload":
@@ -450,7 +460,7 @@ def cmd_root(args, log) -> int:
             print("\n写 boot：l5tk root edl --image <magisk_patched.img> [--part boot_b]")
             print("读分区表：l5tk root edl --gpt")
             return RC_OK if o.ok else RC_FAIL
-        o = eo.flash(args.image, part=args.part, backup=not args.no_backup)
+        o = eo.flash(args.image, part=args.part, backup=True)
         head = ("成功：" if o.ok else "失败：") + o.detail
         print(head)
         # 结论同时落日志：--windowed 的 EXE 在部分终端接不上控制台，
@@ -479,7 +489,7 @@ def cmd_root(args, log) -> int:
     profile = det.profile
     log.info("机型：%s（分 %d）" % (profile.label, det.score))
     o = ops.flash_boot(args.image, profile, part=args.part,
-                       backup=not args.no_backup, force=args.force,
+                       backup=True, force=args.force,
                        via=args.via)
     print(("成功：" if o.ok else "失败：") + o.detail)
     for r in o.reasons:

@@ -26,7 +26,7 @@ ROOT = Path(__file__).resolve().parent
 NAME = "Leaf5Toolkit"
 GP_NAME = "Leaf5Toolkit_gplay"
 SIGN_CN = "SWT"          # 证书显示名；签名时按 Subject 精确匹配
-VERSION = (2, 4, 0, 0)
+VERSION = (2, 4, 2, 0)
 COMPANY = "local"
 PRODUCT = "Leaf5 Toolkit"
 ENTRY = ROOT / "run_app.py"
@@ -35,6 +35,40 @@ ENTRY = ROOT / "run_app.py"
 # ---------------------------------------------------------------- 版本资源
 def _vstr(v: tuple[int, ...]) -> str:
     return "%d.%d.%d.%d" % v
+
+
+def sync_version() -> None:
+    """把 build.py 的 VERSION 回写进源码，让版本号只有一个真相源。
+
+    这个坑踩过：EXE 属性页显示 2.4.1.0，`--version` 却报 2.4.0 ——
+    VERSION 只进了 PyInstaller 的 version-file，从没进包内代码。
+    两边各写各的，发版时对不上，用户拿到的版本信息是错的。
+    真相源放在这里，编译时回写；源码里那两行就成了派生物。
+    """
+    import re
+
+    ver = ".".join(str(x) for x in VERSION[:3])
+
+    init = ROOT / "l5tk" / "__init__.py"
+    src = init.read_text(encoding="utf-8")
+    new, n = re.subn(r'(?m)^__version__ = "[^"]*"$',
+                     '__version__ = "%s"' % ver, src, count=1)
+    if n != 1:
+        # 静默跳过就会重现「版本对不上」，这里必须硬失败
+        raise SystemExit("[x] l5tk/__init__.py 里找不到 __version__ 行，拒绝继续")
+    if new != src:
+        init.write_text(new, encoding="utf-8")
+        print("[*] 版本同步 l5tk/__init__.py -> %s" % ver)
+
+    # pyproject 不对齐的话，pip 装出来的又是另一个版本号
+    pp = ROOT / "pyproject.toml"
+    if pp.is_file():
+        t = pp.read_text(encoding="utf-8")
+        t2, n2 = re.subn(r'(?m)^version = "[^"]*"$',
+                         'version = "%s"' % ver, t, count=1)
+        if n2 == 1 and t2 != t:
+            pp.write_text(t2, encoding="utf-8")
+            print("[*] 版本同步 pyproject.toml -> %s" % ver)
 
 
 def ver_file(out_dir: Path) -> Path:
@@ -100,7 +134,7 @@ def _data_args(gp: bool, work: Path) -> list[str]:
     #   zadig.exe    缺 WinUSB 驱动时拉起它给 05C6:9008 绑驱动
     # 缺了不会打错包，但「EDL 刷 boot」会直接报 no_loader —— 所以在这里喊一声，
     # 别让人打完包才发现这条腿是瘸的。
-    for f in ("lito_op_n10_fhprg.bin", "lito_moto_fhprg.bin", "zadig.exe"):
+    for f in ("lito_moto_fhprg.bin", "lito_op_n10_fhprg.bin", "zadig.exe"):
         p = ROOT / "assets" / f
         if p.is_file():
             args += ["--add-data", "%s;assets" % p]
@@ -219,16 +253,31 @@ def sign(exe: Path | str) -> int:
     lit = want.replace("'", "''")
     # 证书库里通常不止一张证书。Select -First 1 抓到哪张取决枚举顺序，
     # 会把发布者签成别人，所以必须按 Subject 点名，找不到才回落。
+    #
+    # 为什么不用 Get-ChildItem Cert:\CurrentUser\My -CodeSigningCert：
+    # 那两样都由 Certificate provider 提供（-CodeSigningCert 是动态参数，
+    # Cert: 是驱动器），provider 要 Microsoft.PowerShell.Security 模块才挂得上。
+    # PSModulePath 里混进 PowerShell 7 的模块目录时，5.1 子进程加载不到自己的
+    # Security 模块 → 「找不到驱动器 Cert」→ stdout 空 → 被当成「没有证书」
+    # → 静默跳过签名。直接走 .NET X509Store，不依赖 provider/module。
+    #
+    # encoding 钉死 utf-8 + 强制 OutputEncoding：中文 Windows 上 PowerShell
+    # 默认吐 GBK，subprocess text=True 按 locale 解会抛 UnicodeDecodeError，
+    # 同样把异常吞成「没证书」。
     ps = (
-        "$all = Get-ChildItem Cert:\\CurrentUser\\My -CodeSigningCert "
-        "| Where-Object { $_.HasPrivateKey }; "
-        f"$t = $all | Where-Object {{ $_.Subject -eq '{lit}' }} | Select-Object -First 1; "
+        "[Console]::OutputEncoding=[Text.Encoding]::UTF8; "
+        "$s=[System.Security.Cryptography.X509Certificates.X509Store]::new('My','CurrentUser'); "
+        "$s.Open('ReadOnly'); "
+        "$all=@($s.Certificates | Where-Object { $_.HasPrivateKey }); "
+        f"$t=$all | Where-Object {{ $_.Subject -eq '{lit}' }} | Select-Object -First 1; "
         "if (-not $t) { $t = $all | Select-Object -First 1 }; "
-        "if ($t) { $t.Subject + '|' + $t.Thumbprint }"
+        "if ($t) { $t.Subject + '|' + $t.Thumbprint }; "
+        "$s.Close()"
     )
     try:
         p = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
-                           capture_output=True, text=True, timeout=60)
+                           capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=60)
         out = (p.stdout or "").strip()
     except Exception:
         out = ""
@@ -244,7 +293,8 @@ def sign(exe: Path | str) -> int:
     cmd = ("& '%s' sign /sha1 %s /fd SHA256 /tr http://timestamp.digicert.com "
            "/td SHA256 '%s'" % (tool, thumb.strip(), exe))
     r = subprocess.run(["powershell", "-NoProfile", "-Command", cmd],
-                       capture_output=True, text=True, timeout=180)
+                       capture_output=True, text=True,
+                       encoding="utf-8", errors="replace", timeout=180)
     print((r.stdout or r.stderr).strip()[:400])
     if r.returncode == 0:
         print("[+] 已签名")
@@ -274,6 +324,7 @@ def main() -> int:
             "import sys\nfrom l5tk.ui.app import run\nsys.exit(run())\n",
             encoding="utf-8")
 
+    sync_version()
     check_tkinter()
 
     if a.sign:
