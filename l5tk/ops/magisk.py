@@ -330,20 +330,44 @@ class MagiskOps:
                               hint="分区被占用时 dd 会失败；重启再试")
         self.adb.sh("chmod", "644", "%s/stock.img" % DEV_MGK,
                     timeout=self.cfg.timeout_short, root=True)
-        dev_md5 = self.adb.sh_out("md5sum", "%s/stock.img" % DEV_MGK,
-                                  timeout=self.cfg.timeout_normal, root=True).split()
+        self.adb.sh("sync", timeout=self.cfg.timeout_short, root=True)
+        dev_md5 = []
+        for _ in range(3):                    # dd 刚写完时 shell 偶尔空回，重试
+            dev_md5 = self.adb.sh_out("md5sum", "%s/stock.img" % DEV_MGK,
+                                      timeout=self.cfg.timeout_normal,
+                                      root=True).split()
+            if dev_md5:
+                break
+            self.adb.reconnect()
         if not dev_md5:
             raise DeviceError("备份的 md5 读不到，不敢继续（分区未改动）")
 
         self.log.info("  拉回 PC 留档…")
-        self.adb.pull("%s/stock.img" % DEV_MGK, str(plan.stock))
+        # 96 MB 整文件 pull 在这台机器上会静默截断（adb 照样 rc=0），
+        # 而且一断 adbd 就掉 offline。走 gzip：设备侧压到 34 MB 再分块拉。
+        want = self.adb.dev_size("%s/stock.img" % DEV_MGK)
+        if not want:
+            raise DeviceError("备份的字节数读不到，不敢继续（分区未改动）")
+        self.log.info("  设备侧 gzip → %s 字节，分块拉取…" % want)
+        self.adb.pull_gz("%s/stock.img" % DEV_MGK, str(plan.stock),
+                         root=True, expect_size=want)
         if not plan.stock.is_file():
             raise DeviceError("备份没拉回来（分区未改动）")
+
+        # md5 对不上先重拉一次再判：USB 抖一下就把整条链停掉太贵，
+        # 但重拉之后还不一致就必须停 —— 残片当备份比没有备份更危险。
         local_md5 = md5_of(plan.stock)
+        if local_md5 != dev_md5[0]:
+            self.log.info("  备份 md5 不符，重拉一次…")
+            self.adb.reconnect()
+            self.adb.pull_gz("%s/stock.img" % DEV_MGK, str(plan.stock),
+                             root=True, expect_size=want)
+            local_md5 = md5_of(plan.stock)
         if local_md5 != dev_md5[0]:
             raise DeviceError(
                 "备份校验失败：设备 %s != 本地 %s（分区未改动）"
-                % (dev_md5[0], local_md5))
+                % (dev_md5[0], local_md5),
+                hint="备份路径 %s；USB 不稳时可以拔插一次再跑" % plan.stock)
         stock_img = parse_boot(plan.stock)   # 不是 boot 镜像直接抛
         self.log.info("  原版 md5=%s  %s" % (local_md5, stock_img.describe()))
 
@@ -380,7 +404,10 @@ class MagiskOps:
             # 4) 拉回验 kernel 段 —— md5 证明不了"生成的是对的"
             self.adb.sh("chmod", "644", DEV_MGK + "/new-boot.img",
                         timeout=self.cfg.timeout_short, root=True)
-            self.adb.pull(DEV_MGK + "/new-boot.img", str(plan.patched))
+            # 同样是 96 MB 级别，走 gzip + 分块
+            nb = DEV_MGK + "/new-boot.img"
+            self.adb.pull_gz(nb, str(plan.patched), root=True,
+                             expect_size=self.adb.dev_size(nb) or None)
             new_img = parse_boot(plan.patched)
             assert_kernel_unchanged(stock_img, new_img)
             self.log.info("  kernel 未变 %d；ramdisk %d → %d（%+d）"

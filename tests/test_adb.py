@@ -144,3 +144,93 @@ def test_missing_adb_raises(cfg):
     a = Adb(cfg, runner=boom)
     with pytest.raises(AdbError):
         a.devices()
+
+
+# ---------------- 大文件传输 ----------------
+
+def _runner_devices_ok(argv, timeout, handler):
+    from l5tk.core.result import ExecResult
+    args = list(argv)
+    if "devices" in args:
+        return ExecResult(tuple(args), 0,
+                          "List of devices attached\nA\tdevice\n", "", 1)
+    return handler(args)
+
+
+def test_pull_truncated_raises(cfg, tmp_path):
+    """adb pull 会 rc=0 却只落一半 —— 96 MB 分区实测断在 33%。
+
+    这是真机踩到的：残片 33,685,504 字节，md5 与设备侧不符。
+    调用方只看 rc 就会把残片当备份拿去 dd。
+    """
+    from pathlib import Path
+
+    def handler(args):
+        from l5tk.core.result import ExecResult
+        if "pull" in args:
+            Path(args[3]).write_bytes(b"x" * 1024)      # 只写 1 KB 却报成功
+            return ExecResult(tuple(args), 0, "1 file pulled", "", 1)
+        return ExecResult(tuple(args), 0, "", "", 1)
+
+    a = Adb(cfg, runner=lambda argv, t: _runner_devices_ok(argv, t, handler))
+    with pytest.raises(AdbError) as e:
+        a.pull("/dev/block/x", str(tmp_path / "out.img"), expect_size=4096)
+    assert "字节" in str(e.value)
+
+
+def test_pull_chunked_merges_in_order(cfg, tmp_path):
+    """超过 chunk 自动分块：逐块校验大小，再按顺序合并。"""
+    from pathlib import Path
+    from l5tk.core.result import ExecResult
+
+    MB2 = 2 << 20
+    size = MB2 * 2 + 1234                       # 3 块，最后一块 1234 字节
+
+    def handler(args):
+        if "pull" in args:
+            name = args[2].rsplit("/", 1)[-1]
+            n = 1234 if name.endswith("ac") else MB2
+            Path(args[3]).write_bytes(b"\1" * n)
+            return ExecResult(tuple(args), 0, "ok", "", 1)
+        if "ls" in args:
+            return ExecResult(tuple(args), 0, "part_aa\npart_ab\npart_ac\n", "", 1)
+        return ExecResult(tuple(args), 0, "", "", 1)
+
+    a = Adb(cfg, runner=lambda argv, t: _runner_devices_ok(argv, t, handler))
+    out = tmp_path / "out.img"
+    a.pull("/dev/block/x", str(out), expect_size=size, chunk=MB2)
+    assert out.stat().st_size == size
+    assert out.read_bytes()[:4] == b"\1\1\1\1"
+
+
+def test_pull_chunked_reports_bad_block(cfg, tmp_path):
+    """某一块重试到底还是短，必须报出来，不能合并出个半成品。"""
+    from pathlib import Path
+    from l5tk.core.result import ExecResult
+
+    MB2 = 2 << 20
+
+    def handler(args):
+        if "pull" in args:
+            name = args[2].rsplit("/", 1)[-1]
+            n = MB2 - 100 if name.endswith("ab") else MB2   # 第二块永远短
+            Path(args[3]).write_bytes(b"\1" * n)
+            return ExecResult(tuple(args), 0, "ok", "", 1)
+        if "ls" in args:
+            return ExecResult(tuple(args), 0, "part_aa\npart_ab\n", "", 1)
+        if "devices" in args:
+            return ExecResult(tuple(args), 0, "List of devices attached\nA\tdevice\n", "", 1)
+        return ExecResult(tuple(args), 0, "", "", 1)
+
+    a = Adb(cfg, runner=lambda argv, t: handler(list(argv)))
+    import l5tk.core.adb as _m
+    old = _m.time.sleep
+    _m.time.sleep = lambda *_: None          # 别真等 12 次 × 3 秒
+    try:
+        with pytest.raises(AdbError) as e:
+            a.pull("/dev/block/x", str(tmp_path / "o.img"),
+                   expect_size=MB2 * 2, chunk=MB2)
+        assert "分块拉取失败" in str(e.value)
+    finally:
+        _m.time.sleep = old
+

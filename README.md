@@ -710,6 +710,113 @@ l5tk probe                             # 2 只读：补准 ro.product.device
 l5tk root auto --force-rerun           # 3 临时 root，重启即恢复
 ```
 
+---
+
+### 2.4.6 真机实录（2026-11-04 下午，Leaf5 `e913138`）
+
+这一轮把设备刷回原厂再 root，逐段验。**结论先说**：`magisk --full` 能用，但它的前提是
+**设备已经有 su**；从零 root 的那一步在 2.4.6 里做不到（见最后一行的「缺口」）。
+
+准备：从官方 OTA 抽原厂 boot，刷回去，确认干净。
+
+```bash
+l5tk root payload --ota Leaf5_4.2.3-rel_0928_656b72278_update.zip --out work/orig
+#   → work/orig/boot_stock.img  96.0 MB  md5=8082244972c23ca514b9841a3ccfd2d9
+l5tk root flash work/orig/boot_stock.img --via dd --part boot_b
+#   → 写完自动重启；回来后 su 已经不在：
+#     /system/bin/sh: su: inaccessible or not found
+#     ls: /product/bin/su: No such file or directory
+```
+
+原厂 boot 与两个 Magisk patch 过的版本指纹都不一样，这条可以用来判断手上的镜像是哪一版：
+
+| 镜像 | md5 | ramdisk |
+|---|---|---:|
+| 原厂 `boot_stock.img` | `80822449…` | 1,149,614 |
+| Magisk 31.0 patch | `8dfed368…` | 1,279,275（+129,661） |
+| Magisk 31.1 patch | `339a0535…` | — |
+
+#### 1) 传输：整文件 pull 会静默截断，必须 gzip + 分块
+
+96 MB 的 boot 分区直接 `adb pull`，在这台机器上稳定断在 **20~33%**，而且：
+
+- adb **返回 `rc=0`**，错误只写在 stderr（`protocol fault (couldn't read status): connection reset`）；
+- 断完 adbd 就掉 `offline`，得清掉所有 `adb.exe` 进程才连得回来；
+- 残片是 33,685,504 字节 —— 调用方只看 `rc` 就会把它当备份。
+
+现在的做法：设备侧 `gzip -1`（96 MB → 34.5 MB，1.6 s），再 2 MB 一块拉、每块校验字节数、
+失败重试 12 次。实测 34 MB 全程 **不到 1 分钟**，md5 与设备侧一致。
+
+两个坑写在代码注释里，改的时候别改回去：
+
+- `sh()` 必须传**一整条字符串**。传 `("sh", "-c", 脚本)` 会变成 `su -c 'sh -c …'` 再套一层，
+  引号一错位，`gzip` 拿到 0 字节输入、产出 20 字节空 gz 却 `rc=0`，`dev_size` 也会返回
+  286855 这种莫名其妙的数。
+- 分块合并要**边合并边删**。48 块留到最后一次 `rmtree`，会撞上外部的批量删除保护，
+  表现是「拉完了但什么都没发生」。
+
+#### 2) 打补丁 + 写回：全链路通过
+
+```
+备份 md5=8dfed368… 96.0 MB kernel=57.9 MB ramdisk=1.2 MB header=v2
+已推 11 个工具到 /data/local/tmp/mgk/kits        ← 9 个工具 + magisk 别名 + stub.apk
+跑 boot_patch.sh（30~90 秒）
+kernel 未变 60735504；ramdisk 1279294 → 1279294（+0）
+写回 boot_b…  回读 md5 一致
+/data/adb/magisk 现有 14 项
+安装 Magisk App…
+成功：Magisk 已写入 boot_b 并装好 App
+```
+
+`ramdisk +0` 那行是这次特意记下来的：**输入的 boot 已经是 Magisk patch 过的，再 patch 一次
+是幂等的**，所以产物与原版字节完全相同。这不是失败，但也说明——在已经 root 的机器上跑
+`--full`，看不出补丁到底有没有用。要验补丁，得从原厂镜像起（见上面的 md5 表）。
+
+#### 3) 从零 root：2.4.6 做不到，缺口在「临时 root → dd」这一跳
+
+```
+l5tk root auto
+  → 结局：rooted — su -c id 已返回 uid=0（14 秒，GhostLock EDEADLK primed）
+  → 成功：已拿到临时 root（uid=0），但 Magisk 没装上 —— 重启后失效
+```
+
+`root auto` 拿到的是**载荷进程内部**的 uid=0，进程退出就没了；而 `magisk --full` 开头要
+`su -c` 去 dd 分区，此时已经没有 su：
+
+```
+l5tk root magisk --full
+  → 没有可用的 su，没法 dd 读写 boot 分区（这条路线的前提是已经 root）
+```
+
+这一跳在 V1（`leaf5-roottool` 1.1.14）里是连着的：exploit 的载荷提权后直接在同一个上下文里
+做完「备份 → 打补丁 → dd 写回 → 装 App」。同一台机器、同一份原厂 boot，V1 的结果：
+
+```
+in_boot.img md5=8082244972…（原厂）
+kernel 未变 60735504；ramdisk 1149614 → 1279275（+129661）   ← 补丁真的加进去了
+写入 boot_b（98304 KB）；回读 md5=f0758816c23145fb120312e476c8d4fd 一致
+magiskd 已启动 1
+```
+
+**所以从零 root 现在走 V1 的 EXE**；V2 的 `--full` 用来做「已经有 root 时的重装 / 换版本」。
+
+#### 4) 弹框：31.0 会弹，31.1 不会
+
+从零 root 之后，没有任何策略的应用请求 su，`SuRequestActivity` 会顶到前台：
+
+```
+dumpsys window | grep mCurrentFocus
+  → com.topjohnwu.magisk/com.topjohnwu.magisk.ui.surequest.SuRequestActivity
+```
+
+探针 app（`com.a.rok`，uid=10123）里 `su -c id` 的结果是 `Permission denied / exit=13` ——
+在弹框还没点之前就是这个值，点「授予：永久」之后才变 `uid=0`。**弹框本身出现**就是
+31.0 与 31.1 的分界，31.1 里 `SuRequestActivity` 根本不存在。
+
+注意 `am start` 前要 `pm enable`：ONYX 的系统管理会把这个侧载包置为 disabled，
+此时 `am start` 报 `Activity class … does not exist`（不是类没编进去，是包被禁了）。
+
+
 ## 测试
 
 ```bash

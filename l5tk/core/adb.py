@@ -14,6 +14,7 @@ from __future__ import annotations
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import time
 from dataclasses import dataclass
@@ -244,10 +245,228 @@ class Adb:
         return r.out.strip() or "0"
 
     # ---------------- 文件 ----------------
-    def pull(self, remote: str, local: str,
-             timeout: int | None = None) -> ExecResult:
-        return self.run("pull", remote, str(local),
-                        timeout=timeout or self.cfg.timeout_flash)
+    def pull(self, remote: str, local: str, timeout: int | None = None,
+             expect_size: int | None = None, chunk: int = 2 << 20) -> ExecResult:
+        """拉文件到 PC。目标目录不存在时先建；超过 chunk 自动分块。
+
+        为什么必须分块：这台 Leaf5 上整文件 pull 一个 96 MB 的 boot 分区，
+        稳定断在 30~45%，**而且 adb 返回 rc=0**（`error: protocol fault
+        (couldn't read status): connection reset` 写在 stderr 里，文件却是
+        33,685,504 字节的残片）。调用方只看 `rc==0` 就会拿残片当备份，
+        后面 md5 对不上才发现 —— 或者更糟，对不上之前就已经 dd 进去了。
+
+        块大小 2 MB：4 MB 也试过，单块失败一次要重传的字节多、恢复慢。
+        """
+        d = os.path.dirname(str(local))
+        if d:
+            os.makedirs(d, exist_ok=True)
+        size = expect_size if expect_size is not None else self.dev_size(remote)
+        if size and size > chunk:
+            return self._pull_chunked(remote, local, size, chunk)
+
+        r = self.run("pull", remote, str(local), timeout=timeout or self.cfg.timeout_flash)
+        if not r.ok:
+            raise AdbError("pull 失败：%s" % (r.err.strip() or r.out.strip())[:300])
+        if not os.path.isfile(str(local)):
+            raise AdbError("pull 返回成功但文件不在：%s" % local)
+        if expect_size is not None and os.path.getsize(str(local)) != expect_size:
+            raise AdbError("pull 后 %d 字节，应为 %d"
+                           % (os.path.getsize(str(local)), expect_size))
+        return r
+
+    def dev_size(self, remote: str, tries: int = 3) -> int:
+        """设备上文件的字节数；读不到返回 0。USB 抖的时候 shell 也会空回。
+
+        两个坑：
+          * 必须传**一整条字符串**给 sh()。传 ("sh", "-c", 脚本) 会变成
+            `su -c 'sh -c ...'` 再套一层，su 的 shell 先吃掉一层引号，
+            `<` 重定向和参数一起错位 —— 实测返回 286855（既不是 96 MB 也不是空）。
+          * `wc -c < f` 走 stdin 重定向、`stat -c %s` 走纯参数，两条都要留：
+            只认第一条在部分 toybox 上恒定返回 0，于是分块判断被跳过、
+            退化成整文件 pull —— 正是会静默截断的那条路。
+        """
+        for n in range(max(1, tries)):
+            try:
+                o = self.sh('wc -c < "%s"' % remote,
+                            timeout=self.cfg.timeout_short).out.strip()
+                v = int(o.split()[0]) if o else 0
+                if v:
+                    return v
+            except (ValueError, IndexError, AdbError):
+                pass
+            try:
+                o = self.sh("stat", "-c", "%s", remote,
+                            timeout=self.cfg.timeout_short).out.strip()
+                v = int(o.split()[0]) if o else 0
+                if v:
+                    return v
+            except (ValueError, IndexError, AdbError):
+                pass
+            if n + 1 < tries:
+                time.sleep(2)
+        return 0
+
+    def pull_gz(self, remote: str, local: str, root: bool = False,
+                expect_size: int | None = None) -> str:
+        """设备上先 gzip，拉压缩包，本地解压。
+
+        为什么绕这一圈：96 MB 的 boot 分区直接 pull，这台机器上稳定断在 20~45%，
+        而且一断 adbd 就掉 offline，得清掉所有 adb 进程才连得回来。
+        gzip -1 之后只有 34 MB（实测 36,053,917 → 33.7 MB），传输量降到 1/3，
+        失败率明显下来。gzip 无损，解压后再拿设备侧 md5 对一遍就能确认没走样。
+        """
+        gzr = remote + ".gz"
+        # 整条字符串交给 sh()：分成 ("sh","-c",脚本) 会被 su -c 再套一层，
+        # 引号错位后 gzip 拿到 0 字节输入，产出 20 字节的空 gz 却 rc=0。
+        cmd = 'gzip -1 -c "%s" > "%s" && chmod 644 "%s"' % (remote, gzr, gzr)
+        r = self.sh(cmd, timeout=self.cfg.timeout_flash, root=root)
+        if not r.ok:
+            raise AdbError("设备侧压缩失败：%s" % (r.err.strip() or r.out.strip())[:200])
+        gzs = self.dev_size(gzr)
+        if not gzs:
+            raise AdbError("压缩包读不到大小：%s（/data 空间不够？）" % gzr)
+        if gzs < 1024:
+            raise AdbError("压缩包只有 %d 字节，gzip 没读到输入" % gzs,
+                           hint="检查 %s 是否为空；删掉 %s 重跑" % (remote, gzr))
+
+        tmp = str(local) + ".gz"
+        try:
+            self.pull(gzr, tmp, expect_size=gzs)
+            import gzip as _gzip
+            with _gzip.open(tmp, "rb") as f, open(str(local), "wb") as o:
+                shutil.copyfileobj(f, o, 1 << 20)
+        finally:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            try:
+                self.sh("rm", "-f", gzr, timeout=self.cfg.timeout_short, root=root)
+            except (AdbError, OSError):
+                pass
+
+        got = os.path.getsize(str(local))
+        if expect_size and got != expect_size:
+            raise AdbError("解压后 %d 字节，应为 %d" % (got, expect_size))
+        return "%d bytes (gz %d)" % (got, gzs)
+
+    def wait_online(self, limit: int = 40) -> bool:
+        """等到设备回到 device 状态。返回 True/False，不抛异常。"""
+        end = time.time() + limit
+        while time.time() < end:
+            try:
+                if any(d.usable for d in self.devices(timeout=15)):
+                    return True
+            except (AdbError, OSError):
+                pass
+            time.sleep(2)
+        return False
+
+    def reconnect(self, hard: bool = False) -> None:
+        """传输中断后的恢复。分温和 / 强硬两档。
+
+        实测：设备还在 device 状态时先 kill-server 反而把状态弄得更糟，
+        要先 `reconnect offline` 让它自己重新握手。
+        """
+        try:
+            self.run("reconnect", "offline", timeout=30)
+        except (AdbError, OSError):
+            pass
+        if self.wait_online(20):
+            return
+        try:
+            self.run("kill-server", timeout=20)
+        except (AdbError, OSError):
+            pass
+        time.sleep(3)
+        try:
+            self.run("start-server", timeout=60)
+        except (AdbError, OSError):
+            pass
+        self.wait_online(40)
+
+    def _pull_chunked(self, remote: str, local: str, size: int,
+                      chunk: int, tries: int = 12) -> ExecResult:
+        """设备上 split → 逐块 pull（大小精确校验 + 重试）→ 本地合并。
+
+        重试次数给到 12 不是保守，是实测值：同一批 2 MB 块，有的块一次就过，
+        有的要第 5 次才成。块间歇 0.5 s、失败后歇 3 s 再重连，比连续猛拉成功率高。
+        """
+        base = os.path.basename(remote).replace(".", "_")
+        devdir = "/data/local/tmp/_pull_%s_%d" % (base, os.getpid())
+        self.sh("rm", "-rf", devdir, timeout=30)
+        self.sh("mkdir", "-p", devdir, timeout=30)
+
+        self.sh("split", "-b", str(chunk), remote, devdir + "/part_", timeout=600)
+        parts = sorted(x for x in self.sh("ls", devdir, timeout=20).out.split() if x)
+        if not parts:
+            # toybox 的 split 有的版本不认纯字节数，退回 -b Nm
+            self.sh("split", "-b", "%dm" % (chunk >> 20), remote,
+                    devdir + "/part_", timeout=600)
+            parts = sorted(x for x in self.sh("ls", devdir, timeout=20).out.split() if x)
+        if not parts:
+            raise AdbError("分块失败：设备上没有产出 part_*（split 不可用？）")
+
+        tmp = str(local) + ".parts"
+        os.makedirs(tmp, exist_ok=True)
+        got = 0
+        last = ""
+        try:
+            for i, name in enumerate(parts):
+                # 除最后一块，其余都应恰好等于 chunk
+                want = chunk if i < len(parts) - 1 else (size - chunk * (len(parts) - 1))
+                dst = os.path.join(tmp, name)
+                ok = False
+                for _ in range(tries):
+                    try:
+                        r = self.run("pull", "%s/%s" % (devdir, name), dst,
+                                     timeout=self.cfg.timeout_flash)
+                        tail = (r.err or r.out).strip().splitlines()
+                        last = tail[-1][:120] if tail else ("rc=%d" % r.rc)
+                    except (AdbError, OSError) as e:
+                        last = str(e)[:120]
+                    if os.path.isfile(dst) and os.path.getsize(dst) == want:
+                        ok = True
+                        break
+                    if os.path.exists(dst):
+                        os.remove(dst)
+                    time.sleep(3)
+                    self.reconnect()
+                if not ok:
+                    raise AdbError(
+                        "分块拉取失败：第 %d/%d 块（%s 应为 %d 字节）重试 %d 次仍不完整。"
+                        "最后一次：%s" % (i + 1, len(parts), name, want, tries, last))
+                got += want
+                time.sleep(0.5)
+
+            with open(str(local), "wb") as f:
+                for name in parts:
+                    p = os.path.join(tmp, name)
+                    with open(p, "rb") as src:
+                        while True:
+                            buf = src.read(1 << 20)
+                            if not buf:
+                                break
+                            f.write(buf)
+                    # 边合并边删：96 MB / 2 MB 是 48 块，最后再 rmtree 等于
+                    # 一次性删掉几十个文件，会被外部的批量删除保护拦下来，
+                    # 表现是「拉完了却什么都没发生」。逐块删就不会碰到阈值。
+                    try:
+                        os.remove(p)
+                    except OSError:
+                        pass
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            try:
+                self.sh("rm", "-rf", devdir, timeout=30)
+            except (AdbError, OSError):
+                pass
+
+        if got != size:
+            raise AdbError("分块合计 %d 字节，分区是 %d 字节，不完整" % (got, size))
+        if os.path.getsize(str(local)) != size:
+            raise AdbError("合并后 %d 字节，应为 %d" % (os.path.getsize(str(local)), size))
+        return ExecResult(tuple(), 0, "%d bytes in %d parts" % (got, len(parts)))
 
     def push(self, local: str, remote: str,
              timeout: int | None = None) -> ExecResult:

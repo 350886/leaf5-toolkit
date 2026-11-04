@@ -192,7 +192,12 @@ class FakeAdb:
                 return ok(argv, self.dev_su_id + "\n")
             return ok(argv, "su: not found\n", rc=1)
         if rest[:2] == ["stat", "-c"]:
-            return ok(argv, "67108864\n")
+            # 只有分区节点才有 64 MB 这个「容量」语义。普通文件返回空，
+            # 否则 Adb.dev_size() 会拿它当文件大小，把 pull 逼进分块路径，
+            # 而假 adb 没有 split/part 这套东西。
+            if "/dev/block" in " ".join(rest):
+                return ok(argv, "67108864\n")
+            return ok(argv, "")
         return ok(argv, "")
 
 
