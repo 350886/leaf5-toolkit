@@ -14,7 +14,7 @@ def test_parser_has_all_commands():
     assert actions
     assert set(actions[0].choices) == {
         "profiles", "devices", "doctor", "probe", "root", "gplay", "verify",
-        "adapt"}
+        "backup", "restore", "adapt"}
 
 
 def test_profiles(capsys):

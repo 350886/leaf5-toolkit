@@ -407,56 +407,45 @@ class Adb:
         if not parts:
             raise AdbError("分块失败：设备上没有产出 part_*（split 不可用？）")
 
-        tmp = str(local) + ".parts"
-        os.makedirs(tmp, exist_ok=True)
+        tmpdir = str(local) + ".parts"
+        os.makedirs(tmpdir, exist_ok=True)
+        # 本地只用**一个**临时文件，逐块覆盖，从不逐块删除。
+        # 原因不是省 inode：外部有按 turn 统计的批量删除保护（实测阈值 50），
+        # 96 MB / 2 MB 是 48 块，一个分区就能把额度用光，第二个分区开始
+        # rmtree 会被拦下，表现是「备份到第 3 个分区就静默中断」。
+        blob = os.path.join(tmpdir, "blob")
         got = 0
         last = ""
         try:
-            for i, name in enumerate(parts):
-                # 除最后一块，其余都应恰好等于 chunk
-                want = chunk if i < len(parts) - 1 else (size - chunk * (len(parts) - 1))
-                dst = os.path.join(tmp, name)
-                ok = False
-                for _ in range(tries):
-                    try:
-                        r = self.run("pull", "%s/%s" % (devdir, name), dst,
-                                     timeout=self.cfg.timeout_flash)
-                        tail = (r.err or r.out).strip().splitlines()
-                        last = tail[-1][:120] if tail else ("rc=%d" % r.rc)
-                    except (AdbError, OSError) as e:
-                        last = str(e)[:120]
-                    if os.path.isfile(dst) and os.path.getsize(dst) == want:
-                        ok = True
-                        break
-                    if os.path.exists(dst):
-                        os.remove(dst)
-                    time.sleep(3)
-                    self.reconnect()
-                if not ok:
-                    raise AdbError(
-                        "分块拉取失败：第 %d/%d 块（%s 应为 %d 字节）重试 %d 次仍不完整。"
-                        "最后一次：%s" % (i + 1, len(parts), name, want, tries, last))
-                got += want
-                time.sleep(0.5)
-
-            with open(str(local), "wb") as f:
-                for name in parts:
-                    p = os.path.join(tmp, name)
-                    with open(p, "rb") as src:
-                        while True:
-                            buf = src.read(1 << 20)
-                            if not buf:
-                                break
-                            f.write(buf)
-                    # 边合并边删：96 MB / 2 MB 是 48 块，最后再 rmtree 等于
-                    # 一次性删掉几十个文件，会被外部的批量删除保护拦下来，
-                    # 表现是「拉完了却什么都没发生」。逐块删就不会碰到阈值。
-                    try:
-                        os.remove(p)
-                    except OSError:
-                        pass
+            with open(str(local), "wb") as out:
+                for i, name in enumerate(parts):
+                    # 除最后一块，其余都应恰好等于 chunk
+                    want = chunk if i < len(parts) - 1 else (size - chunk * (len(parts) - 1))
+                    ok = False
+                    for _ in range(tries):
+                        try:
+                            # pull 到已存在的路径会截断重写，不需要先删
+                            r = self.run("pull", "%s/%s" % (devdir, name), blob,
+                                         timeout=self.cfg.timeout_flash)
+                            tail = (r.err or r.out).strip().splitlines()
+                            last = tail[-1][:120] if tail else ("rc=%d" % r.rc)
+                        except (AdbError, OSError) as e:
+                            last = str(e)[:120]
+                        if os.path.isfile(blob) and os.path.getsize(blob) == want:
+                            ok = True
+                            break
+                        time.sleep(3)
+                        self.reconnect()
+                    if not ok:
+                        raise AdbError(
+                            "分块拉取失败：第 %d/%d 块（%s 应为 %d 字节）重试 %d 次仍不完整。"
+                            "最后一次：%s" % (i + 1, len(parts), name, want, tries, last))
+                    with open(blob, "rb") as src:
+                        shutil.copyfileobj(src, out, 1 << 20)
+                    got += want
+                    time.sleep(0.5)
         finally:
-            shutil.rmtree(tmp, ignore_errors=True)
+            shutil.rmtree(tmpdir, ignore_errors=True)
             try:
                 self.sh("rm", "-rf", devdir, timeout=30)
             except (AdbError, OSError):
@@ -468,10 +457,97 @@ class Adb:
             raise AdbError("合并后 %d 字节，应为 %d" % (os.path.getsize(str(local)), size))
         return ExecResult(tuple(), 0, "%d bytes in %d parts" % (got, len(parts)))
 
-    def push(self, local: str, remote: str,
-             timeout: int | None = None) -> ExecResult:
-        return self.run("push", str(local), remote,
-                        timeout=timeout or self.cfg.timeout_flash)
+    def push(self, local: str, remote: str, timeout: int | None = None,
+             expect_size: int | None = None, chunk: int = 2 << 20) -> ExecResult:
+        """推文件到设备。大文件自动分块，并按字节数逐块校验。
+
+        push 和 pull 有同一个毛病：这条 USB 链路上传输会在中途断，
+        而 adb 有时照样返回 rc=0。恢复固件时推一个 96 MB 的 boot，
+        推一半断了却"成功"，接着 dd 进去就是半截镜像 —— 比不写更糟。
+        """
+        size = expect_size if expect_size is not None else os.path.getsize(str(local))
+        if size and size > chunk:
+            return self._push_chunked(str(local), remote, size, chunk)
+
+        r = self.run("push", str(local), remote,
+                     timeout=timeout or self.cfg.timeout_flash)
+        if not r.ok:
+            raise AdbError("push 失败：%s" % (r.err.strip() or r.out.strip())[:300])
+        if expect_size is not None:
+            got = self.dev_size(remote)
+            if got and got != expect_size:
+                raise AdbError("push 后设备侧 %d 字节，应为 %d" % (got, expect_size))
+        return r
+
+    def _push_chunked(self, local: str, remote: str, size: int,
+                      chunk: int, tries: int = 12) -> ExecResult:
+        """切一块推一块 → 设备侧字节数校验 → 设备侧 cat 合并。
+
+        本地同样只用一个 blob 反复覆盖（同 _pull_chunked 的删除额度问题）。
+        """
+        base = os.path.basename(remote) or "blob"
+        devdir = "/data/local/tmp/_push_%s_%d" % (base, os.getpid())
+        tmpdir = str(local) + ".parts"
+        os.makedirs(tmpdir, exist_ok=True)
+        blob = os.path.join(tmpdir, "blob")
+
+        self.sh("rm", "-rf", devdir, timeout=30)
+        self.sh("mkdir", "-p", devdir, timeout=30)
+
+        n_parts = (size + chunk - 1) // chunk
+        dev_parts: list[str] = []
+        try:
+            with open(str(local), "rb") as f:
+                for i in range(n_parts):
+                    buf = f.read(chunk)
+                    if not buf:
+                        break
+                    with open(blob, "wb") as o:
+                        o.write(buf)
+                    want = len(buf)
+                    name = "part_%04d" % i
+                    dst = "%s/%s" % (devdir, name)
+                    ok = False
+                    last = ""
+                    for _ in range(tries):
+                        try:
+                            r = self.run("push", blob, dst,
+                                         timeout=self.cfg.timeout_flash)
+                            tail = (r.err or r.out).strip().splitlines()
+                            last = tail[-1][:120] if tail else ("rc=%d" % r.rc)
+                        except (AdbError, OSError) as e:
+                            last = str(e)[:120]
+                        if self.dev_size(dst) == want:
+                            ok = True
+                            break
+                        last = last or "设备侧字节数不对"
+                        time.sleep(3)
+                        self.reconnect()
+                    if not ok:
+                        raise AdbError(
+                            "分块推送失败：第 %d/%d 块（%s 应为 %d 字节）重试 %d 次仍不对。"
+                            "最后一次：%s" % (i + 1, n_parts, name, want, tries, last))
+                    dev_parts.append(dst)
+                    time.sleep(0.3)
+
+            if not dev_parts:
+                raise AdbError("本地文件是空的：%s" % local)
+
+            # 显式列出每块再 cat：通配符靠 shell 排序，块数上千时顺序不一定稳
+            cat = "cat %s > %s" % (" ".join(dev_parts), remote)
+            r = self.sh(cat, timeout=self.cfg.timeout_flash)
+            if not r.ok:
+                raise AdbError("合并分块失败：%s" % (r.err.strip() or r.out.strip())[:200])
+            got = self.dev_size(remote)
+            if got != size:
+                raise AdbError("合并后设备侧 %d 字节，应为 %d" % (got, size))
+            return ExecResult(tuple(), 0, "%d bytes in %d parts" % (got, len(dev_parts)))
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+            try:
+                self.sh("rm", "-rf", devdir, timeout=30)
+            except (AdbError, OSError):
+                pass
 
     def file_size(self, remote: str) -> int:
         """块设备/文件大小，读不到返回 -1。"""

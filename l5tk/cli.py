@@ -112,6 +112,25 @@ def build_parser() -> argparse.ArgumentParser:
     vf = sub.add_parser("verify", help="验收：root / 商店 / GMS 逐项过")
     vf.add_argument("--json", action="store_true")
 
+    # ---------------- 固件备份 / 恢复 ----------------
+    bk = sub.add_parser("backup", help="固件备份：逐分区 dd + 双端 md5 自证")
+    bk.add_argument("--out", default=None,
+                    help="放到哪（默认 work\\firmware，每次一个 l5fw_机型_时间 目录）")
+    bk.add_argument("--part", default="critical",
+                    help="boot / critical / all，或逗号分隔的分区名（boot_b,super）。"
+                         "默认 critical = 启动链 + 系统链，不含 userdata")
+    bk.add_argument("--plain", action="store_true",
+                    help="不压缩，直接留 .img（fastboot 能直刷，占空间大）")
+
+    rs = sub.add_parser("restore", help="从备份目录逐分区写回")
+    rs.add_argument("--src", required=True, help="备份目录（含 manifest.json）")
+    rs.add_argument("--part", default=None, help="只恢复这些分区（默认全部）")
+    rs.add_argument("--no-safety", action="store_true",
+                    help="写前不备份分区当前内容（不推荐：写错了没有退路）")
+    rs.add_argument("--force", action="store_true",
+                    help="镜像比分区小时仍然写（默认会提示但仍写，这个开关只压掉提示）")
+    rs.add_argument("--reboot", action="store_true", help="写完自动重启")
+
     # ---------------- 内核适配 ----------------
     ad = sub.add_parser(
         "adapt", help="内核适配向导：换固件后重新生成 preload.so")
@@ -886,10 +905,47 @@ def cmd_adapt(args, log) -> int:
     return RC_USAGE
 
 
+def cmd_backup(args, log) -> int:
+    from .ops.firmware import backup
+
+    cfg, adb, _fb = _ctx(args, log)
+    out = Path(args.out) if args.out else (cfg.work_dir / "firmware")
+    dest = backup(adb, log, out, args.part, gz=not args.plain,
+                  dry_run=cfg.dry_run)
+    if cfg.dry_run:
+        return RC_DRYRUN
+    print("备份目录：%s" % dest)
+    print("恢复：l5tk restore --src \"%s\"" % dest)
+    return RC_OK
+
+
+def cmd_restore(args, log) -> int:
+    from .ops.firmware import restore
+
+    cfg, adb, _fb = _ctx(args, log)
+    rows = restore(adb, log, args.src, only=args.part,
+                   safety=not args.no_safety, force=args.force,
+                   dry_run=cfg.dry_run)
+    if cfg.dry_run:
+        return RC_DRYRUN
+    bad = [r for r in rows if r[1] != "ok"]
+    if bad:
+        for name, _st, why in bad:
+            log.err("%s：%s" % (name, why))
+        return RC_FAIL
+    if args.reboot:
+        adb.sh("reboot", timeout=cfg.timeout_short, root=True)
+        log.info("已下发重启")
+    else:
+        print("已恢复。写过分区的必须重启才生效：adb reboot")
+    return RC_OK
+
+
 HANDLERS = {
     "profiles": cmd_profiles, "devices": cmd_devices, "doctor": cmd_doctor,
     "probe": cmd_probe, "root": cmd_root, "gplay": cmd_gplay,
     "verify": cmd_verify, "adapt": cmd_adapt,
+    "backup": cmd_backup, "restore": cmd_restore,
 }
 
 

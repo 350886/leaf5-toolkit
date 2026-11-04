@@ -50,6 +50,10 @@ python -m l5tk root magisk              # 装内置的 Magisk App
 python -m l5tk root flash boot.img      # 备份 → 刷入 → 失败自动回滚（--via auto/dd/fastbootd/fastboot）
 python -m l5tk root payload --ota update.zip   # 从官方 OTA 抽原厂 boot.img，不需要设备
 python -m l5tk verify                   # 逐项验收
+python -m l5tk backup --part boot        # 备份固件：启动链 10 个分区，约 5 分钟
+python -m l5tk backup --part critical    # 启动链 + 系统链（含 6 GB super）
+python -m l5tk backup --part all         # 全部分区（含 userdata）
+python -m l5tk restore --src <备份目录>   # 逐分区写回，写前自动再备份
 python -m l5tk adapt scan               # 找本机现成的内核镜像
 python -m l5tk adapt gen boot.img       # 换固件：生成 target.h
 python -m l5tk adapt build <id>         # 编译 preload.so（首次下 NDK）
@@ -194,6 +198,51 @@ model 精确 +40    model 包含 +25    device/name +20    SoC +15    Android +1
 ```
 
 只有 model 一条证据不认（改机型 prop 是常见玩法）。
+
+## 固件备份 / 恢复
+
+`root magisk` 只在刷 boot 前保一份 boot，够它自己用，不够自救。这一层是
+「把设备现在的固件整体抠下来」，理由是官网不一定有你手上这个版本：
+ONYX 只发 OTA 全量包，跨版本升过级、刷过 beta 的机器对不上，就得自己解 payload。
+
+```bash
+python -m l5tk backup --part boot --out D:\bk    # 启动链，10 个分区 / 432 MB / 约 5 分钟
+python -m l5tk backup --part critical            # 启动链 + 系统链（super 6 GB）
+python -m l5tk backup --part all                 # 全部（含 50 GB userdata）
+python -m l5tk backup --part boot_b,dtbo_a       # 只备指定分区
+python -m l5tk backup --plain --part boot        # 不压缩，留 .img 给 fastboot 直刷
+```
+
+产物是 `l5fw_<机型>_<时间>\` 目录：`<分区>.img.gz` + `manifest.json`。
+manifest 记块设备、字节数、md5；恢复按它对账。
+
+```bash
+python -m l5tk restore --src "D:\bk\l5fw_Leaf5_20261104_134049"
+python -m l5tk restore --src "..." --part boot_a        # 只写一个分区
+python -m l5tk restore --src "..." --no-safety          # 跳过写前备份（不建议）
+python -m l5tk restore --src "..." --reboot             # 写完直接重启
+```
+
+三处强制校验：
+
+| 时机 | 校验 | 不过怎么办 |
+|---|---|---|
+| 备份 | 设备侧 md5 vs 本地解压后 md5 | 报错，这一份作废 |
+| 恢复前 | 本地镜像 md5 vs manifest | 报错，一个字节都不写 |
+| 写回后 | 回读分区 md5 vs manifest | 报错，并提示用 `_safety_` 那份退回 |
+
+写每个分区前，会先把**当前**内容备份到 `<备份目录>\_safety_<时间>\` —— 选错镜像时
+还有退路。一个分区失败就停在那个分区，不继续写下一个。
+
+Leaf5 实测（96 MB `boot_a`）：
+
+```
+备份  dd 96 MB → gzip 35 MB → 2 MB 分块拉回 → 解压算 md5
+      md5 d3436c154933   设备侧 / manifest / 本地解压 三处一致
+恢复  安全备份 → 分块推送 96 MB → dd conv=fsync → 回读 md5 一致
+```
+
+备份目录格式与 V1（`leaf5-roottool`）一致，两个工具可以互相恢复。
 
 ## 刷 boot 的安全设计
 
