@@ -26,6 +26,7 @@ from ..core.errors import L5Error
 from ..core.fastboot import Fastboot
 from ..flags import gp_ui_enabled
 from ..logx import Logger, mask
+from ..ops import firmware as fwops
 from ..ops.gplay import GPlay
 from ..ops.probe import Prober
 from ..ops.root import RootOps
@@ -36,6 +37,16 @@ from .theme import ACCENT, BG, DIM, ERR, FG, FONT_CN, FONT_UI, MUTED, OK, PANEL,
 from .thinbar import ThinBar  # noqa: E402
 
 W = 900
+
+# 备份范围下拉框的三档。值是 ops.firmware.pick_parts 认的 spec。
+# userdata 单独说明：它是个人数据（这台机 50 GB），跟「固件」不是一回事；
+# 混进默认档会让一次备份从 5 分钟变成半小时，恢复它才是真正的误伤。
+FW_UI_PRESETS = (
+    ("启动链+系统链（默认）", "critical"),
+    ("启动链 boot 组", "boot"),
+    ("全部分区（含 userdata）", "all"),
+)
+
 # 窗口高度不再按左栏内容撑：左栏装了 11 个按钮 + 每个两行说明，撑到 918 时
 # 在 1080 屏上贴着任务栏、在 1366×768 上直接超出屏幕。现在给一个固定上限，
 # 装不下就滚（左栏是 Canvas）—— 窗口尺寸稳定，能滚的内容不影响主界面。
@@ -77,6 +88,8 @@ class App(tk.Tk):
         # 等于 V1「勾了 Magisk 就自动勾上模块」的结果。Leaf5 上不装的话
         # Magisk App 会卡在启动画面（AMS 对 null ProcessRecord 解引用）。
         self.var_module = tk.BooleanVar(value=True)
+        # 备份范围：默认第二档（启动链 + 系统链，不含 userdata）
+        self.var_fw_part = tk.StringVar(value=FW_UI_PRESETS[0][0])
 
         self._build()
         self._build_menu()
@@ -133,6 +146,11 @@ class App(tk.Tk):
         m_tool.add_command(label="重新检测设备", command=self.act_probe)
         m_tool.add_command(label="清空日志窗口", accelerator="Ctrl+L",
                            command=self.act_clear_log)
+        m_tool.add_separator()
+        # 也挂菜单：左栏是滚动区，屏幕矮时要滚才看得到按钮，
+        # 而备份/恢复恰好是「开不了机」时最急的两个动作。
+        m_tool.add_command(label="备份固件…", command=self.act_fw_backup)
+        m_tool.add_command(label="恢复固件…", command=self.act_fw_restore)
         bar.add_cascade(label="工具", menu=m_tool)
 
         m_help = self._menu(bar)
@@ -207,9 +225,20 @@ class App(tk.Tk):
         # 每项两句，缺一不可：第一句说「点下去发生什么 / 前置条件」，第二句说
         # 「什么时候该点这个、什么时候不该点」。只写功能名等于把判断留给用户，
         # 而用户面对八个按钮时最缺的恰恰是那个判断。
-        actions = [("① 检测设备", self.act_probe,
-                    "读型号 / 内核 / root，只读",
-                    "刚连上设备、或换了机器")]
+        # 固件备份/恢复放在列表最前面：这是唯一一件「现在不做、以后可能再也
+        # 做不了」的事 —— 官方 OTA 只保证最新版，机器上跑的那一版不一定还下
+        # 得到。它只读 dd、不改设备状态，而 root / 刷机正是会把它弄坏的动作。
+        actions = [
+            ("备份固件", self.act_fw_backup,
+             "dd→gzip→拉回，双端 md5 自证",
+             "刷机 / 换 ROM 前先留底片"),
+            ("恢复固件", self.act_fw_restore,
+             "按 manifest 写回，写前先备份当前内容",
+             "刷坏、开不了机、要退回原样"),
+            ("① 检测设备", self.act_probe,
+             "读型号 / 内核 / root，只读",
+             "刚连上设备、或换了机器"),
+        ]
         if gp_ui_enabled():
             actions.append(("② 装 Google Play", self.act_gplay,
                             "需先登录 Google 账号并通过验证",
@@ -273,6 +302,27 @@ class App(tk.Tk):
                          bg=BG, fg=DIM, font=("Segoe UI", 8),
                          justify="left", anchor="w", wraplength=190).pack(
                     fill="x", padx=(10, 0), pady=(0, 4))
+            if text == "备份固件":
+                # 备份范围紧贴「备份固件」摆：它是这次备份的必选项，而「恢复」
+                # 不用选（范围由 manifest 说了算），所以只挂在备份下面。
+                # 用 tk.OptionMenu 不用 ttk.Combobox：后者在 vista 主题的
+                # readonly 态由主题画字，`style configure(foreground=)` 压不住，
+                # V1 打包版实测是一个空黑框（值其实选着，只是看不见）。
+                self.cmb_fw = tk.OptionMenu(
+                    left, self.var_fw_part, *[x[0] for x in FW_UI_PRESETS])
+                self.cmb_fw.configure(bg=PANEL, fg=FG, activebackground=ACCENT,
+                                      activeforeground="#ffffff", relief="flat",
+                                      bd=0, highlightthickness=0, anchor="w",
+                                      font=("Segoe UI", 9), cursor="hand2")
+                m = self.cmb_fw["menu"]
+                m.configure(bg=PANEL, fg=FG, activebackground=ACCENT,
+                            activeforeground="#ffffff", bd=0, tearoff=0,
+                            font=("Segoe UI", 9))
+                self.cmb_fw.pack(fill="x", padx=(10, 0), pady=(1, 0), ipadx=4)
+                tk.Label(left, text="用在·拿不准就用这档",
+                         bg=BG, fg=DIM, font=("Segoe UI", 8),
+                         justify="left", anchor="w", wraplength=190).pack(
+                    fill="x", padx=(10, 0), pady=(0, 4))
 
         ttk.Separator(left, orient="horizontal").pack(fill="x", pady=10)
         tk.Label(left, text="机型档案", bg=BG, fg=MUTED,
@@ -326,6 +376,9 @@ class App(tk.Tk):
         # 勾选框不在 btns 里，单独管：跑到一半改它，读取时机就说不清了
         if getattr(self, "chk_module", None) is not None:
             self.chk_module.configure(state=state)
+        # 备份范围同理：备份跑到一半改预设，下一次点按钮取到的是新值
+        if getattr(self, "cmb_fw", None) is not None:
+            self.cmb_fw.configure(state="disabled" if busy else "normal")
         self.foot.configure(text="执行中…" if busy else "就绪")
 
     def run_async(self, fn) -> None:
@@ -515,6 +568,80 @@ class App(tk.Tk):
             self.emit("  这是原厂镜像：可以交给 Magisk 打补丁，刷坏了也用它刷回来。",
                       "dim")
             self.emit("  下一步点「⑤ 刷入 boot 镜像」，选打好补丁的那份。", "dim")
+        self.run_async(job)
+
+    # ---------------- 固件备份 / 恢复 ----------------
+    # 备份的对象是「这台机器现在这套固件」，不是「官网那个版本」——
+    # 官方 OTA 只保证最新版，机器上跑的那一版不一定还下得到；而刷坏之后
+    # 能救回来的前提，恰好是手里有跟它一字不差的那份镜像。
+
+    def act_fw_backup(self) -> None:
+        # 标签 → spec。找不到就退回默认档（critical），不猜别的
+        spec = dict(FW_UI_PRESETS).get(self.var_fw_part.get(), "critical")
+        if spec == "all" and not messagebox.askyesno(
+                "备份全部分区",
+                "「全部分区」含 userdata（50 GB 上下，装的是你的应用和账号数据）。\n\n"
+                "压缩后仍可能十几 GB，传输很久；而且这份备份一旦恢复，设备会被"
+                "拉回备份那一刻的状态。\n\n"
+                "只为了「刷坏能救回来」，默认那档就够了。仍然要全备？"):
+            return
+
+        out = self.cfg.work_dir / "firmware"
+
+        def job():
+            self.emit("== 固件备份（%s）==" % spec, "head")
+            dest = fwops.backup(self.adb, self._bridge(echo_ok=True), out, spec)
+            self.emit("✓ 备份目录：%s" % dest, "ok")
+            self.emit("  每个分区一个 .img.gz，manifest.json 里存着每个分区的 md5。",
+                      "dim")
+            self.emit("  把这个目录整个拷到别的盘留一份；恢复时点「恢复固件」选它。",
+                      "dim")
+        self.run_async(job)
+
+    def act_fw_restore(self) -> None:
+        fw = self.cfg.work_dir / "firmware"
+        d = filedialog.askdirectory(
+            title="选择固件备份目录（里面有 manifest.json）",
+            initialdir=str(fw if fw.is_dir() else self.cfg.base_dir))
+        if not d:
+            return
+        try:
+            mf = fwops.read_manifest(d)
+        except L5Error as e:
+            messagebox.showerror("不是备份目录", e.render())
+            return
+
+        parts = mf.get("parts") or []
+        if not parts:
+            messagebox.showerror("备份是空的", "manifest.json 里没有分区条目。")
+            return
+        dev = mf.get("device") or {}
+        if not messagebox.askyesno(
+                "确认恢复固件",
+                "目录：%s\n来源设备：%s / %s\n备份时间：%s\n"
+                "分区：%d 个，合计 %.1f MB\n\n%s\n\n"
+                "顺序：写前先把该分区当前内容再备份一份（_safety_ 目录）"
+                "→ 推送 → dd 写回 → 回读 md5 比对。\n"
+                "一个分区校验不过就停，不会继续往下搅。"
+                "写完必须重启才生效。\n\n继续？"
+                % (Path(d).name, dev.get("model") or "?", dev.get("build") or "?",
+                   mf.get("created") or "?", len(parts),
+                   (mf.get("total_bytes") or 0) / 1048576.0,
+                   ", ".join(p["name"] for p in parts))):
+            return
+
+        def job():
+            self.emit("== 固件恢复 ==", "head")
+            rows = fwops.restore(self.adb, self._bridge(echo_ok=True), d,
+                                 only=None, safety=True)
+            bad = [r for r in rows if r[1] != "ok"]
+            for name, st, why in bad:
+                self.emit("✗ %s：%s" % (name, why), "err")
+            self.emit("✓ 恢复完成：%d/%d 个分区" % (len(rows) - len(bad), len(rows)),
+                      "ok" if not bad else "warn")
+            self.emit("  重启才生效：adb reboot，或长按电源键。", "dim")
+            self.emit("  开机后仍不对：备份目录旁的 _safety_<时间>\\ 里存着"
+                      "写入前的内容。", "dim")
         self.run_async(job)
 
     def act_edl_flash(self) -> None:

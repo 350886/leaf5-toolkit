@@ -205,6 +205,9 @@ model 精确 +40    model 包含 +25    device/name +20    SoC +15    Android +1
 「把设备现在的固件整体抠下来」，理由是官网不一定有你手上这个版本：
 ONYX 只发 OTA 全量包，跨版本升过级、刷过 beta 的机器对不上，就得自己解 payload。
 
+**界面上在左栏最前面**：`备份固件`（下面有范围下拉框）/ `恢复固件`，
+另加 菜单 → 工具 里各一条。GUI 走的还是下面这套 ops，产物和命令行互认。
+
 ```bash
 python -m l5tk backup --part boot --out D:\bk    # 启动链，10 个分区 / 432 MB / 约 5 分钟
 python -m l5tk backup --part critical            # 启动链 + 系统链（super 6 GB）
