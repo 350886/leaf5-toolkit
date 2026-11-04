@@ -56,9 +56,10 @@ SECTIONS: list[tuple[str, str]] = [
 ## 怎么用
 左栏下面那个下拉框选范围 → 点「备份固件」：
 
-- `启动链+系统链（默认）` —— boot/recovery/vbmeta/dtbo + super/system/vendor 等，
-  约 15 个分区。Leaf5 上启动链 10 个分区 / 432 MB，压缩后 155 MB，约 5 分钟。
-- `启动链 boot 组` —— 只保启动链，最快，够救「刷 boot 刷崩」。
+- `启动链（默认，约 432 MB）` —— boot/recovery/vbmeta/dtbo 的 a/b 两槽，Leaf5 上
+  10 个分区。压缩后 155 MB，约 5 分钟。**刷机刷崩、开不了机，靠这一份就能退回。**
+- `加系统盘 super（约 6.9 GB）` —— 再带上 super（6.1 GB）和 misc/persist/modem。
+  只有「系统盘本身被写坏、官网又拿不到同版本 OTA」才需要；设备上要先腾出 ≈ 8 GB。
 - `全部分区（含 userdata）` —— 加上 50 GB 的 userdata。会先弹一次确认。
 
 产物落在 `work\\firmware\\l5fw_<机型>_<时间>\\`：每个分区一个 `<分区>.img.gz`，

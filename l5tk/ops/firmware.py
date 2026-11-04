@@ -192,68 +192,93 @@ def pick_parts(all_parts: list[Part], spec: str | None) -> list[Part]:
 def _dump_one(adb: Adb, log, part: Part, dest: Path, gz: bool = True) -> dict:
     """把一个分区 dd 出来、拉回 PC、双向校验。返回 manifest 里的一条。"""
     remote = "%s/%s.img" % (DEV_DIR, part.name)
+    gzr = remote + ".gz"
     t0 = time.time()
     log.info("  %-16s %6.1f MB → 设备内 dd…" % (part.name, part.mb))
 
     adb.sh("mkdir", "-p", DEV_DIR, timeout=adb.cfg.timeout_short, root=True)
     adb.sh("chmod", "777", DEV_DIR, timeout=adb.cfg.timeout_short, root=True)
 
-    # 读到分区末尾才算完；bs=4M 是 toybox dd 认的最大常规块
-    cmd = ('dd if=/dev/block/by-name/%s of=%s bs=4M 2>&1; echo RC=$?'
-           % (part.name, remote))
-    timeout = max(300, int(part.size / (4 << 20)) + 180)
-    r = adb.sh(cmd, timeout=timeout, root=True)
-    if "RC=0" not in (r.out or ""):
+    # 先算清楚这一趟要占多少设备空间：dd 出的原始 img 和压缩出的 gz 会同时在盘上，
+    # 分块 pull 还要再放一份 split 副本。super 是 6 GB —— 等 dd 跑完十分钟才报
+    # ENOSPC，不如一开始就说清楚。free=0 表示读不到，按「未知」放行。
+    need = part.size + (part.size // 4 if gz else 0)
+    free = adb.dev_free(DEV_DIR)
+    if free and free < need:
         raise DeviceError(
-            "dd 备份 %s 失败" % part.name,
-            hint=((r.out or r.err or "无输出").strip().splitlines() or [""])[-1][:200],
+            "设备 /data 可用 %.0f MB，这个分区备份需要 ≈ %.0f MB"
+            % (free / 1e6, need / 1e6),
+            hint="先清 /data/local/tmp 下的 _l5fw / _pull_* 残留；"
+                 "或用 --part 分批，先备小分区",
         )
 
-    got = adb.dev_size(remote)
-    if got != part.size:
-        raise DeviceError(
-            "dd 产物 %d 字节，分区是 %d 字节" % (got, part.size),
-            hint="分区可能被并发写入（系统在跑）；重启后再备份",
-        )
+    # 无论成败都要扫干净。失败时留下的是 6 GB img + 1.3 GB gz，用户下一次备份
+    # 会在开头就撞空间不足，看起来像「第二次也坏了」。
+    try:
+        # 读到分区末尾才算完；bs=4M 是 toybox dd 认的最大常规块
+        cmd = ('dd if=/dev/block/by-name/%s of=%s bs=4M 2>&1; echo RC=$?'
+               % (part.name, remote))
+        timeout = max(300, int(part.size / (4 << 20)) + 180)
+        r = adb.sh(cmd, timeout=timeout, root=True)
+        if "RC=0" not in (r.out or ""):
+            raise DeviceError(
+                "dd 备份 %s 失败" % part.name,
+                hint=((r.out or r.err or "无输出").strip().splitlines() or [""])[-1][:200],
+            )
 
-    dev_md5 = (adb.sh_out("md5sum " + remote, timeout=max(120, int(part.mb) + 60),
-                          root=True).split() or [""])[0]
-    if not dev_md5:
-        raise DeviceError("读不到设备侧 md5（%s）" % part.name)
+        got = adb.dev_size(remote)
+        if got != part.size:
+            raise DeviceError(
+                "dd 产物 %d 字节，分区是 %d 字节" % (got, part.size),
+                hint="分区可能被并发写入（系统在跑）；重启后再备份",
+            )
 
-    # 传输：gz 压一遍再走分块 pull。96 MB 分区直接拉会断在 30% 左右，
-    # 而且 adb 返回 rc=0 —— 这条链路上压缩换带宽是唯一稳的做法。
-    if gz:
-        gzr = remote + ".gz"
-        c = 'gzip -1 -c "%s" > "%s" && chmod 644 "%s"' % (remote, gzr, gzr)
-        rc = adb.sh(c, timeout=max(300, int(part.mb) + 120), root=True)
-        if not rc.ok:
-            raise DeviceError("设备侧压缩失败",
-                              hint=(rc.err or rc.out).strip()[:200])
-        gzs = adb.dev_size(gzr)
-        if gzs < 1024:
-            raise DeviceError("压缩包只有 %d 字节，gzip 没读到输入" % gzs)
+        dev_md5 = (adb.sh_out("md5sum " + remote, timeout=max(120, int(part.mb) + 60),
+                              root=True).split() or [""])[0]
+        if not dev_md5:
+            raise DeviceError("读不到设备侧 md5（%s）" % part.name)
 
-        local_gz = dest / ("%s.img.gz" % part.name)
-        adb.pull(gzr, str(local_gz), expect_size=gzs)
-        local_md5, local_size = _md5_gz(local_gz)
-        fname, fsize = local_gz.name, local_gz.stat().st_size
-        adb.sh("rm", "-f", gzr, remote, timeout=adb.cfg.timeout_short, root=True)
-    else:
-        local_img = dest / ("%s.img" % part.name)
-        adb.pull(remote, str(local_img), expect_size=part.size)
-        local_md5 = _md5_file(local_img)
-        local_size = local_img.stat().st_size
-        fname, fsize = local_img.name, local_size
-        adb.sh("rm", "-f", remote, timeout=adb.cfg.timeout_short, root=True)
+        # 传输：gz 压一遍再走分块 pull。96 MB 分区直接拉会断在 30% 左右，
+        # 而且 adb 返回 rc=0 —— 这条链路上压缩换带宽是唯一稳的做法。
+        if gz:
+            c = 'gzip -1 -c "%s" > "%s" && chmod 644 "%s"' % (remote, gzr, gzr)
+            rc = adb.sh(c, timeout=max(300, int(part.mb) + 120), root=True)
+            if not rc.ok:
+                raise DeviceError("设备侧压缩失败",
+                                  hint=(rc.err or rc.out).strip()[:200])
+            gzs = adb.dev_size(gzr)
+            if gzs < 1024:
+                raise DeviceError("压缩包只有 %d 字节，gzip 没读到输入" % gzs)
 
-    if local_size != part.size:
-        raise DeviceError("%s 拉回后 %d 字节，分区是 %d" % (part.name, local_size, part.size))
-    if local_md5 != dev_md5:
-        raise DeviceError(
-            "%s 校验失败：设备 %s != 本地 %s" % (part.name, dev_md5[:12], local_md5[:12]),
-            hint="USB 链路在传输中损坏了数据，这一份不能用；重跑一次备份",
-        )
+            # 压缩包里已经有全部数据，原始 img 立刻删掉。super 的 img 是 6 GB，
+            # 分块 pull 还要在盘上再放一份 1.3 GB 的 split 副本 —— 不删这 6 GB
+            # 就容易在 split 写到一半时空间见底。
+            adb.sh("rm", "-f", remote, timeout=adb.cfg.timeout_short, root=True)
+
+            local_gz = dest / ("%s.img.gz" % part.name)
+            adb.pull(gzr, str(local_gz), expect_size=gzs)
+            local_md5, local_size = _md5_gz(local_gz)
+            fname, fsize = local_gz.name, local_gz.stat().st_size
+        else:
+            local_img = dest / ("%s.img" % part.name)
+            adb.pull(remote, str(local_img), expect_size=part.size)
+            local_md5 = _md5_file(local_img)
+            local_size = local_img.stat().st_size
+            fname, fsize = local_img.name, local_size
+
+        if local_size != part.size:
+            raise DeviceError("%s 拉回后 %d 字节，分区是 %d"
+                              % (part.name, local_size, part.size))
+        if local_md5 != dev_md5:
+            raise DeviceError(
+                "%s 校验失败：设备 %s != 本地 %s" % (part.name, dev_md5[:12], local_md5[:12]),
+                hint="USB 链路在传输中损坏了数据，这一份不能用；重跑一次备份",
+            )
+    finally:
+        try:
+            adb.sh("rm", "-f", gzr, remote, timeout=adb.cfg.timeout_short, root=True)
+        except Exception:                        # 清理失败不能盖住真正的原因
+            pass
 
     log.ok("  %-16s %6.1f MB  md5 %s  %.0fs"
            % (part.name, part.mb, local_md5[:12], time.time() - t0))
@@ -285,7 +310,7 @@ def _device_info(adb: Adb) -> dict:
     }
 
 
-def backup(adb: Adb, log, out_dir: str | Path, part_spec: str = "critical",
+def backup(adb: Adb, log, out_dir: str | Path, part_spec: str = "boot",
            gz: bool = True, dry_run: bool = False) -> Path:
     """备份指定分区到 out_dir 下的一个新目录，返回该目录。"""
     require_root(adb, "备份固件")

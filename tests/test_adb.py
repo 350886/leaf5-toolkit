@@ -234,3 +234,189 @@ def test_pull_chunked_reports_bad_block(cfg, tmp_path):
     finally:
         _m.time.sleep = old
 
+
+
+def test_pull_chunked_falls_back_to_execout(cfg, tmp_path):
+    """pull 通道坏掉时，同一块改走 exec-out 必须能救回来。
+
+    2026-11-04 真机：super 的 1.3 GB gz，第 567 块起 pull 每次都停在 1,245,184
+    字节（rc=0，重连 12 次一模一样）；同一时刻 exec-out cat 一次拿满 2,097,152。
+    设备侧 md5 秒算得出 —— 坏的是 sync 通道，不是文件、不是空间。
+    """
+    from pathlib import Path
+    from l5tk.core.result import ExecResult
+
+    MB2 = 2 << 20
+    size = MB2 * 2
+
+    def handler(args):
+        if "pull" in args:
+            Path(args[3]).write_bytes(b"x" * 1024)      # 永远只落 1 KB
+            return ExecResult(tuple(args), 0, "[  3%] part", "", 1)
+        if "ls" in args and "-l" in args:
+            return ExecResult(tuple(args), 0,
+                              "-rw-r--r-- 1 shell shell %d part_aa\n"
+                              "-rw-r--r-- 1 shell shell %d part_ab\n"
+                              % (MB2, MB2), "", 1)
+        if "ls" in args:
+            return ExecResult(tuple(args), 0, "part_aa\npart_ab\n", "", 1)
+        return ExecResult(tuple(args), 0, "", "", 1)
+
+    a = Adb(cfg, runner=lambda argv, t: handler(list(argv)),
+            bin_runner=lambda argv, t: b"\2" * MB2)
+    out = tmp_path / "out.img"
+    a.pull("/dev/block/x", str(out), expect_size=size, chunk=MB2)
+
+    assert out.stat().st_size == size
+    assert out.read_bytes()[:4] == b"\2\2\2\2"          # 内容来自 exec-out
+    assert any("exec-out" in c for c in a._last_pull_note()) if hasattr(
+        a, "_last_pull_note") else True
+
+
+def test_split_partial_detected(cfg, tmp_path):
+    """split 在 /data 写满时会写一半就退出。
+
+    表现是：前面几块完好、后面几块短或压根没有，只有拉到那一块才炸 ——
+    时间全花在「以为快好了」上。必须在 split 之后当场认出来。
+    """
+    from l5tk.core.result import ExecResult
+
+    MB2 = 2 << 20
+
+    def handler(args):
+        if "ls" in args and "-l" in args:
+            return ExecResult(tuple(args), 0,
+                              "-rw-r--r-- 1 shell shell %d part_aa\n" % (MB2 // 2), "", 1)
+        if "ls" in args:
+            return ExecResult(tuple(args), 0, "part_aa\npart_ab\n", "", 1)
+        return ExecResult(tuple(args), 0, "", "", 1)
+
+    a = Adb(cfg, runner=lambda argv, t: handler(list(argv)))
+    with pytest.raises(AdbError) as e:
+        a.pull("/dev/block/x", str(tmp_path / "o.img"),
+               expect_size=MB2 * 2, chunk=MB2)
+    assert "split 中途退出" in str(e.value)
+
+
+def test_pull_chunked_free_space_guard(cfg, tmp_path):
+    """空间不够要在 split 之前就拒绝，别先花十分钟 split 再报错。"""
+    from l5tk.core.result import ExecResult
+
+    MB2 = 2 << 20
+
+    def handler(args):
+        if "df" in args:
+            return ExecResult(tuple(args), 0,
+                              "Filesystem     1K-blocks     Used Available Use% Mounted on\n"
+                              "/dev/block/dm-13 50000000 40000000  100000   1% /data\n",
+                              "", 1)
+        return ExecResult(tuple(args), 0, "", "", 1)
+
+    a = Adb(cfg, runner=lambda argv, t: handler(list(argv)))
+    with pytest.raises(AdbError) as e:
+        a.pull("/dev/block/x", str(tmp_path / "o.img"),
+               expect_size=MB2 * 100, chunk=MB2)
+    assert "/data 可用" in str(e.value)
+
+
+def test_exec_out_to_writes_bytes(cfg, tmp_path):
+    """exec-out 是二进制通路：非 UTF-8 的字节必须原样落盘。"""
+    a = Adb(cfg, runner=lambda argv, t: ExecResult(tuple(argv), 0, "", "", 1),
+            bin_runner=lambda argv, t: bytes(range(256)))
+    dst = tmp_path / "b.bin"
+    n = a.exec_out_to("/data/local/tmp/x", str(dst))
+    assert n == 256
+    assert dst.read_bytes() == bytes(range(256))
+
+
+def test_pull_chunked_falls_back_to_execout(cfg, tmp_path):
+    """pull 通道坏掉时，同一块改走 exec-out 必须能救回来。
+
+    2026-11-04 真机：super 的 1.3 GB gz，第 567 块起 pull 每次都停在 1,245,184
+    字节（rc=0，重连 12 次一模一样）；同一时刻 exec-out cat 一次拿满 2,097,152。
+    设备侧 md5 秒算得出 —— 坏的是 sync 通道，不是文件、不是空间。
+    """
+    from pathlib import Path
+    from l5tk.core.result import ExecResult
+
+    MB2 = 2 << 20
+    size = MB2 * 2
+
+    def handler(args):
+        if "pull" in args:
+            Path(args[3]).write_bytes(b"x" * 1024)      # 永远只落 1 KB
+            return ExecResult(tuple(args), 0, "[  3%] part", "", 1)
+        if "ls" in args and "-l" in args:
+            return ExecResult(tuple(args), 0,
+                              "-rw-r--r-- 1 shell shell %d part_aa\n"
+                              "-rw-r--r-- 1 shell shell %d part_ab\n"
+                              % (MB2, MB2), "", 1)
+        if "ls" in args:
+            return ExecResult(tuple(args), 0, "part_aa\npart_ab\n", "", 1)
+        return ExecResult(tuple(args), 0, "", "", 1)
+
+    a = Adb(cfg, runner=lambda argv, t: handler(list(argv)),
+            bin_runner=lambda argv, t: b"\2" * MB2)
+    out = tmp_path / "out.img"
+    a.pull("/dev/block/x", str(out), expect_size=size, chunk=MB2)
+
+    assert out.stat().st_size == size
+    assert out.read_bytes()[:4] == b"\2\2\2\2"          # 内容来自 exec-out
+    assert any("exec-out" in c for c in a._last_pull_note()) if hasattr(
+        a, "_last_pull_note") else True
+
+
+def test_split_partial_detected(cfg, tmp_path):
+    """split 在 /data 写满时会写一半就退出。
+
+    表现是：前面几块完好、后面几块短或压根没有，只有拉到那一块才炸 ——
+    时间全花在「以为快好了」上。必须在 split 之后当场认出来。
+    """
+    from l5tk.core.result import ExecResult
+
+    MB2 = 2 << 20
+
+    def handler(args):
+        if "ls" in args and "-l" in args:
+            return ExecResult(tuple(args), 0,
+                              "-rw-r--r-- 1 shell shell %d part_aa\n" % (MB2 // 2), "", 1)
+        if "ls" in args:
+            return ExecResult(tuple(args), 0, "part_aa\npart_ab\n", "", 1)
+        return ExecResult(tuple(args), 0, "", "", 1)
+
+    a = Adb(cfg, runner=lambda argv, t: handler(list(argv)))
+    with pytest.raises(AdbError) as e:
+        a.pull("/dev/block/x", str(tmp_path / "o.img"),
+               expect_size=MB2 * 2, chunk=MB2)
+    assert "split 中途退出" in str(e.value)
+
+
+def test_pull_chunked_free_space_guard(cfg, tmp_path):
+    """空间不够要在 split 之前就拒绝，别先花十分钟 split 再报错。"""
+    from l5tk.core.result import ExecResult
+
+    MB2 = 2 << 20
+
+    def handler(args):
+        if "df" in args:
+            return ExecResult(tuple(args), 0,
+                              "Filesystem     1K-blocks     Used Available Use% Mounted on\n"
+                              "/dev/block/dm-13 50000000 40000000  100000   1% /data\n",
+                              "", 1)
+        return ExecResult(tuple(args), 0, "", "", 1)
+
+    a = Adb(cfg, runner=lambda argv, t: handler(list(argv)))
+    with pytest.raises(AdbError) as e:
+        a.pull("/dev/block/x", str(tmp_path / "o.img"),
+               expect_size=MB2 * 100, chunk=MB2)
+    assert "/data 可用" in str(e.value)
+
+
+def test_exec_out_to_writes_bytes(cfg, tmp_path):
+    """exec-out 是二进制通路：非 UTF-8 的字节必须原样落盘。"""
+    a = Adb(cfg, runner=lambda argv, t: ExecResult(tuple(argv), 0, "", "", 1),
+            bin_runner=lambda argv, t: bytes(range(256)))
+    dst = tmp_path / "b.bin"
+    n = a.exec_out_to("/data/local/tmp/x", str(dst))
+    assert n == 256
+    assert dst.read_bytes() == bytes(range(256))

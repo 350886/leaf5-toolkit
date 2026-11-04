@@ -116,9 +116,10 @@ def build_parser() -> argparse.ArgumentParser:
     bk = sub.add_parser("backup", help="固件备份：逐分区 dd + 双端 md5 自证")
     bk.add_argument("--out", default=None,
                     help="放到哪（默认 work\\firmware，每次一个 l5fw_机型_时间 目录）")
-    bk.add_argument("--part", default="critical",
+    bk.add_argument("--part", default="boot",
                     help="boot / critical / all，或逗号分隔的分区名（boot_b,super）。"
-                         "默认 critical = 启动链 + 系统链，不含 userdata")
+                         "默认 boot = 启动链 10 个分区（约 432 MB）；"
+                         "critical 会多备 super（6.1 GB，慢）")
     bk.add_argument("--plain", action="store_true",
                     help="不压缩，直接留 .img（fastboot 能直刷，占空间大）")
 

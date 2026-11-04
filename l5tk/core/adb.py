@@ -27,6 +27,7 @@ from .result import ExecResult
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 Runner = Callable[[Sequence[str], int], ExecResult]
+BinRunner = Callable[[Sequence[str], int], bytes]
 
 
 @dataclass(frozen=True)
@@ -78,14 +79,47 @@ def _default_runner(argv: Sequence[str], timeout: int) -> ExecResult:
                        hint="检查是否被杀软拦了子进程")
 
 
+def _default_bin_runner(argv: Sequence[str], timeout: int) -> bytes:
+    """同一条 adb 调用，但 stdout 按字节返回、不做解码。
+
+    为什么必须单独一条：`_decode` 会把 GBK / 非法 UTF-8 的字节序列换成别的字符，
+    2 MB 的 gz 片段经它一过就再也拼不回去了。这里只做「取原始 stdout」这一件事。
+    """
+    try:
+        p = subprocess.run(list(argv), capture_output=True, timeout=timeout,
+                           creationflags=CREATE_NO_WINDOW, stdin=subprocess.DEVNULL)
+        return p.stdout or b""
+    except subprocess.TimeoutExpired as e:
+        return e.stdout or b""
+    except FileNotFoundError:
+        raise AdbError("找不到 adb：%s" % argv[0],
+                       hint="把 adb.exe 放到 assets/bin/，或用 L5TK_ADB 指定完整路径")
+    except OSError as e:
+        raise AdbError("adb 启动失败：%s" % e,
+                       hint="检查是否被杀软拦了子进程")
+
+
 class Adb:
     """一台设备的操作句柄。serial 为空时用「唯一在线设备」。"""
 
     def __init__(self, cfg: Config, serial: str = "",
-                 runner: Runner | None = None):
+                 runner: Runner | None = None,
+                 bin_runner: BinRunner | None = None):
         self.cfg = cfg
         self._serial = serial or cfg.serial
         self._run = runner or _default_runner
+        # 二进制通路（exec-out）。显式传就用传的；只注入了文本 runner 说明在测试里，
+        # 复用同一个 handler 把 out 转回字节，免得测试偷偷起真 adb 进程。
+        if bin_runner is not None:
+            self._run_bin = bin_runner
+        elif runner is not None:
+            self._run_bin = self._bin_via_runner
+        else:
+            self._run_bin = _default_bin_runner
+
+    def _bin_via_runner(self, argv: Sequence[str], timeout: int) -> bytes:
+        """测试注入 runner 时的二进制通路。"""
+        return self._run(argv, timeout).out.encode("utf-8", "surrogateescape")
 
     # ---------------- 底层 ----------------
     def argv(self, *args: str) -> list[str]:
@@ -306,6 +340,41 @@ class Adb:
                 time.sleep(2)
         return 0
 
+    def dev_free(self, path: str = "/data") -> int:
+        """设备侧可用字节数。读不到返回 0，调用方按「未知」处理，不要当「没空间」。
+
+        df 的输出列数在不同 toybox 版本上不一致（有的挂载点带空格），
+        所以按「认得出 Avail 列」解析，认不出就返回 0。
+        """
+        try:
+            out = self.sh("df", "-k", path, timeout=self.cfg.timeout_short).out
+        except (AdbError, OSError):
+            return 0
+        for line in out.splitlines()[1:]:
+            f = line.split()
+            if len(f) < 4:
+                continue
+            try:
+                return int(f[3]) * 1024
+            except ValueError:
+                continue
+        return 0
+
+    def exec_out_to(self, remote: str, local: str,
+                    timeout: int | None = None) -> int:
+        """用 `exec-out cat` 把远程文件原样读回本地，返回写下的字节数。
+
+        这是 pull 的备用通路，不是重复实现。实测同一块 2 MB 的 gz 片段：
+        `adb pull` 停在 1,245,184 字节且 rc=0（残片被当成功），
+        紧接着 `adb exec-out cat` 一次拿满 2,097,152。两条路走的是不同通道 ——
+        pull 走 sync 协议，exec-out 走 shell 命令流，一条坏的时候另一条常常还活着。
+        """
+        buf = self._run_bin(self.argv("exec-out", 'cat "%s"' % remote),
+                            timeout or self.cfg.timeout_flash)
+        with open(str(local), "wb") as f:
+            f.write(buf)
+        return len(buf)
+
     def pull_gz(self, remote: str, local: str, root: bool = False,
                 expect_size: int | None = None) -> str:
         """设备上先 gzip，拉压缩包，本地解压。
@@ -387,15 +456,29 @@ class Adb:
 
     def _pull_chunked(self, remote: str, local: str, size: int,
                       chunk: int, tries: int = 12) -> ExecResult:
-        """设备上 split → 逐块 pull（大小精确校验 + 重试）→ 本地合并。
+        """设备上 split → 逐块拉（大小精确校验 + 两条通路轮换）→ 本地合并。
 
         重试次数给到 12 不是保守，是实测值：同一批 2 MB 块，有的块一次就过，
-        有的要第 5 次才成。块间歇 0.5 s、失败后歇 3 s 再重连，比连续猛拉成功率高。
+        有的要第 5 次才成。块间歇 0.5 s、失败后歇 2 s 再重连，比连续猛拉成功率高。
+
+        ⚠ 关键：每块都在 pull / exec-out 之间轮换，不能死磕 pull。
+        2026-11-04 实测 super 那个 1.3 GB 的 gz：667 块全部正常，第 567 块起
+        pull 每次停在 1,245,184 字节（rc 仍是 0），重连 12 次都一样；
+        同一时刻换 exec-out cat 一次拿满 2,097,152。设备侧文件 md5 能秒算，
+        说明坏的是 sync 通道，不是文件、不是空间。
         """
         base = os.path.basename(remote).replace(".", "_")
         devdir = "/data/local/tmp/_pull_%s_%d" % (base, os.getpid())
         self.sh("rm", "-rf", devdir, timeout=30)
         self.sh("mkdir", "-p", devdir, timeout=30)
+
+        free = self.dev_free("/data/local/tmp")
+        need = size + (size // 20)          # split 副本 + 每个 part 的目录项余量
+        if free and free < need:
+            raise AdbError(
+                "设备 /data 可用 %.0f MB，分块要再占 %.0f MB"
+                % (free / 1e6, need / 1e6),
+                hint="先清 /data/local/tmp 下的 _pull_* / _l5fw 残留，再重试")
 
         self.sh("split", "-b", str(chunk), remote, devdir + "/part_", timeout=600)
         parts = sorted(x for x in self.sh("ls", devdir, timeout=20).out.split() if x)
@@ -407,6 +490,16 @@ class Adb:
         if not parts:
             raise AdbError("分块失败：设备上没有产出 part_*（split 不可用？）")
 
+        # split 的半成品必须当场认出来。它在 /data 写满时会写一半就退出，
+        # 前面几块完好、后面几块短甚至没有 —— 只有拉到那一块才炸，
+        # 时间全花在「以为快好了」上。
+        made = self._sum_sizes(devdir)
+        if made and made != size:
+            raise AdbError(
+                "分块产物合计 %d 字节，源文件是 %d —— split 中途退出了"
+                % (made, size),
+                hint="多半是 /data 空间不够；清掉 %s 后重试" % devdir)
+
         tmpdir = str(local) + ".parts"
         os.makedirs(tmpdir, exist_ok=True)
         # 本地只用**一个**临时文件，逐块覆盖，从不逐块删除。
@@ -416,32 +509,53 @@ class Adb:
         blob = os.path.join(tmpdir, "blob")
         got = 0
         last = ""
+        via_cat = 0
         try:
             with open(str(local), "wb") as out:
                 for i, name in enumerate(parts):
                     # 除最后一块，其余都应恰好等于 chunk
                     want = chunk if i < len(parts) - 1 else (size - chunk * (len(parts) - 1))
+                    src = "%s/%s" % (devdir, name)
                     ok = False
-                    for _ in range(tries):
-                        try:
-                            # pull 到已存在的路径会截断重写，不需要先删
-                            r = self.run("pull", "%s/%s" % (devdir, name), blob,
-                                         timeout=self.cfg.timeout_flash)
-                            tail = (r.err or r.out).strip().splitlines()
-                            last = tail[-1][:120] if tail else ("rc=%d" % r.rc)
-                        except (AdbError, OSError) as e:
-                            last = str(e)[:120]
+                    # 单块超时不能沿用 timeout_flash(600s)：2 MB 正常 0.2 秒，
+                    # 真卡住时 600 秒才跳出，一块就能占掉十分钟 —— 实测过。
+                    tmo = min(self.cfg.timeout_flash, 60)
+                    for attempt in range(tries):
+                        # 偶数次 pull、奇数次 exec-out：一条坏了立刻换另一条，
+                        # 而不是拿同一条烂路连撞 12 次。
+                        if attempt % 2 == 0:
+                            try:
+                                r = self.run("pull", src, blob, timeout=tmo)
+                                tail = (r.err or r.out).strip().splitlines()
+                                last = tail[-1][:120] if tail else ("rc=%d" % r.rc)
+                            except (AdbError, OSError) as e:
+                                last = str(e)[:120]
+                        else:
+                            try:
+                                n = self.exec_out_to(src, blob, timeout=tmo)
+                                last = "exec-out 只读到 %d 字节" % n
+                            except (AdbError, OSError) as e:
+                                last = str(e)[:120]
                         if os.path.isfile(blob) and os.path.getsize(blob) == want:
                             ok = True
+                            if attempt % 2:
+                                via_cat += 1
                             break
-                        time.sleep(3)
+                        # 第一次失败不要动连接：链路好的时候 reconnect 反而把它
+                        # 踢下线，下一次 pull 必败，12 次全撞在同一个坑里。
+                        # 两条通路都试过了才怀疑连接。
+                        if attempt == 0:
+                            continue
+                        time.sleep(1)
                         self.reconnect()
                     if not ok:
                         raise AdbError(
-                            "分块拉取失败：第 %d/%d 块（%s 应为 %d 字节）重试 %d 次仍不完整。"
-                            "最后一次：%s" % (i + 1, len(parts), name, want, tries, last))
-                    with open(blob, "rb") as src:
-                        shutil.copyfileobj(src, out, 1 << 20)
+                            "分块拉取失败：第 %d/%d 块（%s 应为 %d 字节）"
+                            "两条通路各试了 %d 次仍不完整。最后一次：%s"
+                            % (i + 1, len(parts), name, want,
+                               (tries + 1) // 2, last))
+                    with open(blob, "rb") as srcf:
+                        shutil.copyfileobj(srcf, out, 1 << 20)
                     got += want
                     time.sleep(0.5)
         finally:
@@ -455,7 +569,26 @@ class Adb:
             raise AdbError("分块合计 %d 字节，分区是 %d 字节，不完整" % (got, size))
         if os.path.getsize(str(local)) != size:
             raise AdbError("合并后 %d 字节，应为 %d" % (os.path.getsize(str(local)), size))
-        return ExecResult(tuple(), 0, "%d bytes in %d parts" % (got, len(parts)))
+        return ExecResult(tuple(), 0,
+                          "%d bytes in %d parts (exec-out 兜底 %d 块)"
+                          % (got, len(parts), via_cat))
+
+    def _sum_sizes(self, devdir: str) -> int:
+        """把分块目录里所有普通文件的字节数加起来。读不到返回 0。"""
+        try:
+            out = self.sh("ls", "-l", devdir, timeout=30).out
+        except (AdbError, OSError):
+            return 0
+        total = 0
+        for line in out.splitlines():
+            f = line.split()
+            if len(f) < 5 or not f[0].startswith("-"):
+                continue
+            try:
+                total += int(f[4])
+            except ValueError:
+                continue
+        return total
 
     def push(self, local: str, remote: str, timeout: int | None = None,
              expect_size: int | None = None, chunk: int = 2 << 20) -> ExecResult:

@@ -42,8 +42,8 @@ W = 900
 # userdata 单独说明：它是个人数据（这台机 50 GB），跟「固件」不是一回事；
 # 混进默认档会让一次备份从 5 分钟变成半小时，恢复它才是真正的误伤。
 FW_UI_PRESETS = (
-    ("启动链+系统链（默认）", "critical"),
-    ("启动链 boot 组", "boot"),
+    ("启动链（默认，约 432 MB）", "boot"),
+    ("加系统盘 super（约 6.9 GB）", "critical"),
     ("全部分区（含 userdata）", "all"),
 )
 
@@ -319,7 +319,7 @@ class App(tk.Tk):
                             activeforeground="#ffffff", bd=0, tearoff=0,
                             font=("Segoe UI", 9))
                 self.cmb_fw.pack(fill="x", padx=(10, 0), pady=(1, 0), ipadx=4)
-                tk.Label(left, text="用在·拿不准就用这档",
+                tk.Label(left, text="用在·刷坏开机链要救回来（432 MB）",
                          bg=BG, fg=DIM, font=("Segoe UI", 8),
                          justify="left", anchor="w", wraplength=190).pack(
                     fill="x", padx=(10, 0), pady=(0, 4))
@@ -577,7 +577,7 @@ class App(tk.Tk):
 
     def act_fw_backup(self) -> None:
         # 标签 → spec。找不到就退回默认档（critical），不猜别的
-        spec = dict(FW_UI_PRESETS).get(self.var_fw_part.get(), "critical")
+        spec = dict(FW_UI_PRESETS).get(self.var_fw_part.get(), "boot")
         if spec == "all" and not messagebox.askyesno(
                 "备份全部分区",
                 "「全部分区」含 userdata（50 GB 上下，装的是你的应用和账号数据）。\n\n"
