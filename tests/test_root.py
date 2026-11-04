@@ -261,6 +261,24 @@ def test_magisk_apk_found(cfg, tmp_path):
     assert apk.name == "Magisk-v31.1.apk"
 
 
+def test_magisk_apk_prefers_pinned_31_0(cfg, tmp_path):
+    """目录里同时躺着 31.0 和 31.1 时必须选 31.0。
+
+    31.1 把 su 的授权请求删了（daemon 只剩 app_notify），没写过策略的 uid
+    一律 Deny —— 表现是"root 装好了，app 请求 root 还是 exit=13"。
+    """
+    app = tmp_path / "app"
+    d = app / "assets" / "magisk"
+    d.mkdir(parents=True)
+    (d / "Magisk-v31.1.apk").write_bytes(b"PK\x03\x04old")
+    (d / "Magisk-v31.0.apk").write_bytes(b"PK\x03\x04new")
+    cfg.base_dir = app
+    cfg.bundle_dir = app
+    apk = _ops(cfg, FakeAdb(), FakeFb()).magisk_apk()
+    assert apk is not None
+    assert apk.name == "Magisk-v31.0.apk"
+
+
 def test_magisk_apk_missing_is_reported(cfg, tmp_path):
     _cfg_with_apk(cfg, tmp_path, name=None)
     adb = FakeAdb()

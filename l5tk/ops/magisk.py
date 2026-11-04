@@ -47,6 +47,21 @@ APK_TOOLS = {
     "assets/util_functions.sh": "util_functions.sh",
 }
 
+# 「有就抠」的项。31.0 的 boot_patch.sh 里有
+#   ./magiskboot compress=xz stub.apk stub.xz      （第 179 行）
+#   add 0644 overlay.d/sbin/stub.xz stub.xz        （第 197 行）
+# 缺 stub.apk 打出来的 ramdisk 里没有 App 存根，Magisk App 装了也看不到超级用户。
+# 31.1 把这个文件从 APK 里整个删了，所以不能放 APK_TOOLS（那会直接报"版本不对"）。
+APK_EXTRA = {
+    "assets/stub.apk": "stub.apk",
+}
+
+# 默认装哪个版本。31.1 把 su 的授权请求删了：daemon 侧只剩 app_notify()，
+# policies 表里没有的 uid 一律 SuPolicy::default() = Deny，客户端看到
+# Permission denied / exit=13 —— 跟"root 没做好"长得一模一样。
+# SuRequestActivity 在 26.3~31.0 之间都有，所以钉在 31.0。
+PREFERRED_APK = "Magisk-v31.0.apk"
+
 # /data/adb/magisk 里必须有 busybox —— setup_magisk_env 只看它在不在，
 # 不满足直接 abort，模块永远不挂载。这一步必须在重启之前做。
 RUNTIME = ("busybox", "magiskboot", "magiskinit", "magisk32", "magisk64",
@@ -79,15 +94,31 @@ description=修 ONYX services.jar 里 ActivityManagerService.addPackageDependenc
 
 
 def find_apk(cfg) -> Path | None:
-    """内置 Magisk APK：EXE 同级 -> 打包内。同级优先，换版本不用重新打包。"""
-    for base in (cfg.base_dir, cfg.bundle_dir):
+    """内置 Magisk APK：EXE 同级 -> 打包内。同级优先，换版本不用重新打包。
+
+    两轮扫描，不是按目录顺序撞运气：目录里同时放着 31.0 和 31.1 时，
+    原来那句 `sorted(...)[0]` 靠字符串序恰好选到 31.0 —— 一旦谁重命名
+    （Magisk-31.1-official.apk）就会静默换成没弹框的版本。先把钉住的
+    版本在所有候选目录里找遍，找不到才退回「文件名最大的那个」。
+    """
+    bases = (cfg.base_dir, cfg.bundle_dir)
+
+    for base in bases:                       # 第一轮：钉住的版本
+        p = Path(base) / "assets" / "magisk" / PREFERRED_APK
+        if p.is_file():
+            return p
+
+    fallback = None                          # 第二轮：任意可用 APK
+    for base in bases:
         d = Path(base) / "assets" / "magisk"
         if not d.is_dir():
             continue
-        apks = sorted(p for p in d.glob("*.apk") if p.is_file())
+        apks = sorted((p for p in d.glob("*.apk") if p.is_file()),
+                      key=lambda p: p.name)
         if apks:
-            return apks[0]
-    return None
+            fallback = apks[-1]
+            break
+    return fallback
 
 
 def extract_tools(apk: Path, dest: Path) -> dict[str, Path]:
@@ -110,6 +141,24 @@ def extract_tools(apk: Path, dest: Path) -> dict[str, Path]:
             with z.open(arc) as src:
                 p.write_bytes(src.read())
             out[dst] = p
+
+        # 「有就抠」的项：stub.apk 只有 31.0 及更早才有
+        for arc, dst in APK_EXTRA.items():
+            if arc not in names:
+                continue
+            p = dest / dst
+            with z.open(arc) as src:
+                p.write_bytes(src.read())
+            out[dst] = p
+
+    # boot_patch.sh 第 178 行无条件跑 `./magiskboot compress=xz magisk magisk.xz`，
+    # 而 APK 里那份叫 magisk64（官方 App 的准备阶段会替它复制过去）。
+    # 少了这个别名，脚本不报错，只是打出来的 ramdisk 里没有 magisk 二进制 ——
+    # 表现是"刷完开机有 Magisk App、su 却一直 Permission denied"。
+    if "magisk64" in out and "magisk" not in out:
+        alias = dest / "magisk"
+        alias.write_bytes(out["magisk64"].read_bytes())
+        out["magisk"] = alias
     return out
 
 
@@ -302,6 +351,9 @@ class MagiskOps:
         with tempfile.TemporaryDirectory(prefix="l5tk_mgk_") as tmp:
             tools = extract_tools(apk, Path(tmp) / "kits")
             self.adb.sh("mkdir", "-p", DEV_KITS, timeout=self.cfg.timeout_short, root=True)
+            # mkdir 是 root 跑的，建出来是 755；adb push 走的是 shell 身份，
+            # 往 755 的目录里写会直接 Permission denied。先放开再推。
+            self.adb.sh("chmod", "777", DEV_KITS, timeout=self.cfg.timeout_short, root=True)
             for fname, local in tools.items():
                 pr = self.adb.push(str(local), "%s/%s" % (DEV_KITS, fname))
                 if not pr.ok:

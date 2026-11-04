@@ -58,9 +58,31 @@ def make_jar(path, dex: bytes):
 def test_extract_all_tools(tmp_path):
     apk = make_apk(tmp_path / "Magisk.apk")
     out = extract_tools(apk, tmp_path / "kits")
-    assert set(out) == set(APK_TOOLS.values())
+    # 多出 magisk：boot_patch.sh 第 178 行无条件跑 compress=xz magisk magisk.xz，
+    # 而 APK 里那份叫 magisk64，官方 App 的准备阶段会替它复制，我们本地补
+    assert set(out) == set(APK_TOOLS.values()) | {"magisk"}
     assert out["boot_patch.sh"].read_bytes().startswith(b"ELF")
     assert out["magiskboot"].is_file()
+    # 别名必须是 magisk64 的同一份字节，不能是空壳 —— 空壳的话开机后 su 就是不工作
+    assert out["magisk"].read_bytes() == out["magisk64"].read_bytes()
+
+
+def test_extract_stub_when_present(tmp_path):
+    """31.0 的 boot_patch.sh 要 stub.apk；31.1 把这个文件删了。
+
+    缺了它不报错，只是 ramdisk 里没有 App 存根 —— 表现是 Magisk App 看不到超级用户。
+    """
+    names = {arc: b"ELF" + arc.encode() for arc in APK_TOOLS}
+    names["assets/stub.apk"] = b"PK\x03\x04stub"
+    apk = make_apk(tmp_path / "Magisk.apk", names=names)
+    out = extract_tools(apk, tmp_path / "kits")
+    assert out["stub.apk"].read_bytes() == b"PK\x03\x04stub"
+
+
+def test_extract_without_stub_is_not_an_error(tmp_path):
+    apk = make_apk(tmp_path / "Magisk.apk")     # 31.1 的布局：没有 stub.apk
+    out = extract_tools(apk, tmp_path / "kits")
+    assert "stub.apk" not in out
 
 
 def test_extract_reports_missing_entry(tmp_path):

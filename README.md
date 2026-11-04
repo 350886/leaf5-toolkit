@@ -360,7 +360,7 @@ C:\Users\<你>\AppData\Local\Programs\Python\Python312\python.exe   带 Tk 8.6 +
 |---|---|---|---|
 | `adb.exe` + `AdbWinApi.dll` + `AdbWinUsbApi.dll` | `assets/bin/` | 8.7 MB | 与设备通信；两个 dll 必须和 adb.exe 同目录 |
 | `fastboot.exe` | `assets/bin/` | 2.2 MB | 刷 boot、读 bootloader 状态 |
-| `Magisk-v31.1.apk` | `assets/magisk/` | 10.2 MB | `root magisk` 直接装到设备 |
+| `Magisk-v31.0.apk` | `assets/magisk/` | 10.7 MB | `root magisk` 直接装到设备 |
 | `preload.so` + `device_root.sh` | `assets/payload/` | 2.4 MB | `root exploit` 的内核载荷 |
 | exploit 源码（`src/` + `targets/onyx-leaf5/target.h`） | `assets/exploit_src/` | 740 KB | 适配向导现场重编 preload.so 的原料 |
 | `lito_op_n10_fhprg.bin` | `assets/` | 748 KB | firehose programmer，EDL 刷 boot 用它进 9008 |
@@ -369,11 +369,40 @@ C:\Users\<你>\AppData\Local\Programs\Python\Python312\python.exe   带 Tk 8.6 +
 查找顺序：**EXE 同级 `assets\` > 包内解出的 `assets\` > `PATH`**。
 同级优先是有意的：换 adb 二进制或换 Magisk 版本时，丢文件进同级目录就生效，不用重新打包。
 
+### Magisk 钉在 31.0，不是随手选的
+
+31.1 把 `su` 的**授权请求**整个删了：daemon 侧只剩 `app_notify()`，没有
+`app_request()`，`policies` 表里查不到的 uid 一律按 `SuPolicy::default() = Deny`
+直接回 `EACCES`。客户端看到的就是 `Permission denied` / `exit=13` —— 跟
+「root 没刷好」在界面上完全分不出来。`SuRequestActivity` 在 **26.3 ~ 31.0**
+之间都在，所以默认装 31.0：
+
+- 没写过策略的 app 请求 `su` → 设备上弹「授予本装置使用 Root 权限」，
+  点「授予：永久」→ `policies` 表新增 `uid=<app>|policy=2`，之后 `su` 返回 0。
+- 不想点弹框，也可以直接写库（需要设备已 root）：
+  ```bash
+  adb shell su -c 'magisk --sqlite "insert or replace into policies values(10122,2,0,1,1)"'
+  adb shell su -c 'magisk --sqlite "select * from policies"'   # 读回自证
+  ```
+  `magisk --sqlite` 的输出带列名（`uid=2000|policy=2|...`），取值要按 `=` 后面提。
+
+`find_apk()` 两轮扫描：先把 `PREFERRED_APK`（`Magisk-v31.0.apk`）在所有候选目录里
+找遍，找不到才退回「文件名最大的那个」。原来那句 `sorted(...)[0]` 是撞运气 ——
+谁把文件重命名成 `Magisk-31.1-official.apk`，就会静默换成没弹框的版本。
+
+打补丁时还有两个只有真跑过才知道的坑，代码里都补了：
+
+| 现象 | 原因 | 处理 |
+|---|---|---|
+| `boot_patch.sh` 刷完，Magisk App 在但 `su` 一直拒绝 | 脚本第 178 行无条件跑 `compress=xz magisk magisk.xz`，而 APK 里那份叫 `magisk64`。缺这个别名不报错，只是打出来的 ramdisk 里没有 magisk 二进制 | `extract_tools()` 复制一份 `magisk64` 为 `magisk` |
+| 31.0 打补丁失败 / App 看不到超级用户 | 第 179、197 行要 `stub.apk`（App 存根），31.1 把这个文件从 APK 里删了 | `APK_EXTRA` 按「有就抠」处理，31.1 的布局不会因此报错 |
+| `adb push … /data/local/tmp/mgk/kits: Permission denied` | `mkdir` 是 root 跑的（建出来 755），`adb push` 走 shell 身份 | 建完目录立刻 `chmod 777` |
+
 这些二进制**不进 git**（`.gitignore` 里排掉了），clone 下来要打包时自己放进去：
 
 ```bash
 cp /path/to/platform-tools/{adb.exe,fastboot.exe,AdbWinApi.dll,AdbWinUsbApi.dll} assets/bin/
-cp /path/to/Magisk-v31.1.apk assets/magisk/
+cp /path/to/Magisk-v31.0.apk assets/magisk/
 cp /path/to/lito_op_n10_fhprg.bin assets/      # 高通 firehose programmer
 cp /path/to/zadig.exe assets/                  # WinUSB 驱动安装器
 ```
@@ -654,7 +683,7 @@ kernel 段 60,735,504 字节）走同一条流程 —— 自动切段、解出�
 
 | 设备 | 是否 root | 依据 | 怎么测的 |
 |---|---|---|---|
-| Leaf5（`e913138`） | **是** | `id` → `uid=0(root)`、`context=u:r:magisk:s0`；`magisk -v` → `31.1:MAGISK:R`；`su` 在 `/product/bin/su` 与 `/debug_ramdisk/su` | 只读命令 |
+| Leaf5（`e913138`） | **是** | `id` → `uid=0(root)`、`context=u:r:magisk:s0`；`magisk -v` → `31.0:MAGISK:R`（2026-11-04 由 31.1 降级后复测）；`su` 在 `/product/bin/su` 与 `/debug_ramdisk/su` | 只读命令 |
 | Tab8 | 未测 | 没有真机 | — |
 | Tab8C | 未测 | 没有真机 | — |
 | Tab10 | 未测 | 没有真机 | — |
@@ -666,7 +695,7 @@ Leaf5 现场（只读采集）：`selinux=Permissive`、`verity=enforcing`、`sl
 
 | 命令 | 结果 |
 |---|---|
-| `l5tk root status` | 认出 `Magisk 31.1:MAGISK:R`，`flash.locked=0` 已解锁 |
+| `l5tk root status` | 认出 `Magisk 31.0:MAGISK:R`，`flash.locked=0` 已解锁 |
 | `l5tk --dry-run root auto` | 第 0 步短路：**已有 root**，不继续 |
 | `l5tk --dry-run root exploit` | 短路：**系统已有 su，不必再跑内核载荷** |
 
